@@ -345,7 +345,7 @@
   <h2>Chainguard Registry (libraries.cgr.dev)</h2>
   <div class="settings-row">
     <label for="cgr-user">Username</label>
-    <input type="text" id="cgr-user" placeholder="user@example.com" autocomplete="username">
+    <input type="text" id="cgr-user" placeholder="a3f7c92e1d048b5619ace7f23b840d12e5a9c671/82fb4c01d7e93a50" autocomplete="username">
     <label for="cgr-pass" style="margin-left:0.5rem">Password / Token</label>
     <input type="password" id="cgr-pass" placeholder="••••••••" autocomplete="current-password">
     <span class="settings-saved" id="saved-msg">Saved</span>
@@ -634,21 +634,37 @@ function copyResults() {
   lines.push('');
 
   const vw = Math.max(7, ...rows.map(r => r.version.length + (r.version === latest ? 9 : 0))) + 2;
-  lines.push('Version'.padEnd(vw) + 'npmjs.com'.padEnd(12) + 'Chainguard');
-  lines.push('─'.repeat(vw + 22));
+  const dw = Math.max(9, ...rows.map(r => r.published ? formatDate(r.published).length : 0)) + 2;
+  lines.push('Version'.padEnd(vw) + 'Published'.padEnd(dw) + 'npmjs.com'.padEnd(12) + 'Chainguard');
+  lines.push('─'.repeat(vw + dw + 22));
 
   for (const row of rows) {
     const v = row.version + (row.version === latest ? ' (latest)' : '');
-    lines.push(v.padEnd(vw) + (row.npmTarball ? '✓' : '✗').padEnd(12) + cgrTextLabel(row.cgrTarball));
+    const d = row.published ? formatDate(row.published) : '—';
+    lines.push(v.padEnd(vw) + d.padEnd(dw) + (row.npmTarball ? '✓' : '✗').padEnd(12) + cgrTextLabel(row.cgrTarball));
   }
 
-  navigator.clipboard.writeText(lines.join('\n')).then(() => {
+  const text = lines.join('\n');
+  const confirm = () => {
     const btn = document.getElementById('copy-btn');
     if (!btn) return;
     btn.textContent = 'Copied!';
     btn.classList.add('copied');
     setTimeout(() => { btn.textContent = 'Copy results'; btn.classList.remove('copied'); }, 2000);
-  });
+  };
+
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(confirm);
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    confirm();
+  }
 }
 
 function escHtml(s) {

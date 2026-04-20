@@ -1,6 +1,4 @@
 // Run with: ~/.bun/bin/bun server.js
-import { readFileSync } from 'fs';
-
 const htmlPath = new URL('./index.html', import.meta.url);
 
 Bun.serve({
@@ -9,7 +7,7 @@ Bun.serve({
     const url = new URL(req.url);
 
     if (url.pathname === '/') {
-      return new Response(readFileSync(htmlPath), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      return new Response(Bun.file(htmlPath), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
     if (url.pathname.startsWith('/api/cgr/')) {
@@ -43,3 +41,6 @@ Bun.serve({
 });
 
 console.log('Listening on http://localhost:3000');
+
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
