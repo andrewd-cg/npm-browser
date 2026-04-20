@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NPM Package Browser</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #f4f6f9;
+    color: #1a1a2e;
+    min-height: 100vh;
+  }
+
+  /* Header */
+  header {
+    background: #1a1a2e;
+    color: #fff;
+    padding: 0 1.5rem;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  }
+  header h1 {
+    font-size: 1rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  header h1 span { color: #7dd3fc; }
+  #settings-btn {
+    background: none;
+    border: none;
+    color: #94a3b8;
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    transition: background 0.15s, color 0.15s;
+  }
+  #settings-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+  #settings-btn.active { color: #7dd3fc; }
+
+  /* Settings panel */
+  #settings-panel {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 1.25rem 1.5rem;
+    display: none;
+  }
+  #settings-panel.open { display: block; }
+  #settings-panel h2 {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #64748b;
+    margin-bottom: 1rem;
+  }
+  .settings-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .settings-row label {
+    font-size: 0.875rem;
+    color: #475569;
+    min-width: 130px;
+  }
+  .settings-row input {
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.875rem;
+    width: 220px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .settings-row input:focus { border-color: #7dd3fc; }
+  .settings-saved {
+    font-size: 0.78rem;
+    color: #22c55e;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .settings-saved.show { opacity: 1; }
+
+  /* Main content */
+  main { max-width: 900px; margin: 2rem auto; padding: 0 1.5rem; }
+
+  /* Search */
+  .search-box {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+  }
+  #pkg-input {
+    flex: 1;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 1rem;
+    outline: none;
+    background: #fff;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  #pkg-input:focus {
+    border-color: #7dd3fc;
+    box-shadow: 0 0 0 3px rgba(125,211,252,0.15);
+  }
+  #fetch-btn {
+    background: #1a1a2e;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 22px;
+    font-size: 0.95rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s;
+    white-space: nowrap;
+  }
+  #fetch-btn:hover { background: #2d2d50; }
+  #fetch-btn:disabled { background: #94a3b8; cursor: default; }
+
+  /* Filters */
+  .filter-row {
+    display: flex;
+    gap: 1.25rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+  .filter-label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: #475569;
+    cursor: pointer;
+    user-select: none;
+  }
+  .filter-label input[type="checkbox"] { cursor: pointer; accent-color: #1a1a2e; }
+
+  /* Error banners */
+  .banners { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+  .banner {
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .banner.warn { background: #fef9c3; color: #854d0e; border: 1px solid #fde68a; }
+  .banner.error { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+
+  /* Results */
+  #results { background: #fff; border-radius: 10px; border: 1px solid #e2e8f0; overflow: hidden; }
+
+  .results-header {
+    padding: 0.9rem 1.25rem;
+    border-bottom: 1px solid #e2e8f0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+  .results-title { display: flex; align-items: baseline; gap: 0.6rem; }
+  .results-header .pkg-name { font-weight: 600; font-size: 1rem; color: #1a1a2e; text-decoration: none; }
+  .results-header .pkg-name:hover { text-decoration: underline; color: #2563eb; }
+  .results-header .count { font-size: 0.8rem; color: #64748b; }
+
+  .stats-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .stat-block {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 5px 12px;
+    min-width: 72px;
+  }
+  .stat-block.stat-sub { background: #fff; }
+  .stat-label { font-size: 0.68rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; white-space: nowrap; }
+  .stat-value { font-size: 0.95rem; font-weight: 700; color: #1a1a2e; }
+  .stat-pct { font-size: 0.75rem; font-weight: 500; color: #64748b; }
+  .stat-pct.built  { color: #1d4ed8; }
+  .stat-pct.mirror { color: #7e22ce; }
+  .stat-divider { width: 1px; height: 32px; background: #e2e8f0; margin: 0 0.25rem; }
+
+  .header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; }
+  #copy-btn {
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #475569;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  #copy-btn:hover { background: #e2e8f0; color: #1a1a2e; border-color: #94a3b8; }
+  #copy-btn.copied { background: #f0fdf4; color: #16a34a; border-color: #86efac; }
+
+  .table-wrap { overflow-x: auto; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+  }
+  thead tr { background: #f8fafc; }
+  th {
+    padding: 10px 16px;
+    text-align: left;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #64748b;
+    border-bottom: 1px solid #e2e8f0;
+    white-space: nowrap;
+  }
+  td {
+    padding: 9px 16px;
+    border-bottom: 1px solid #f1f5f9;
+    vertical-align: middle;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #f8fafc; }
+  tbody tr.latest { background: #f0fdf4; }
+  tbody tr.latest:hover { background: #dcfce7; }
+
+  .version-cell {
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-size: 0.83rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .badge-latest {
+    background: #22c55e;
+    color: #fff;
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 99px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .date-cell { font-size: 0.82rem; color: #64748b; white-space: nowrap; }
+  .check-cell { text-align: center; }
+  .check-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    color: #16a34a;
+    font-size: 1.1rem;
+    text-decoration: none;
+    transition: background 0.12s;
+  }
+  .check-link:hover { background: #dcfce7; }
+  .check-wrap { display: inline-flex; align-items: center; gap: 0.35rem; }
+  .cgr-badge {
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 99px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .cgr-badge.built { background: #dbeafe; color: #1d4ed8; }
+  .cgr-badge.mirror { background: #f3e8ff; color: #7e22ce; }
+
+  .cross {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    color: #cbd5e1;
+    font-size: 1.1rem;
+  }
+
+  /* Loading spinner */
+  .spinner {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    border: 2px solid #e2e8f0;
+    border-top-color: #7dd3fc;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #status {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: #94a3b8;
+    font-size: 0.9rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  #status.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>npm <span>package browser</span></h1>
+  <button id="settings-btn" title="Settings" aria-label="Settings">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  </button>
+</header>
+
+<div id="settings-panel">
+  <h2>Chainguard Registry (libraries.cgr.dev)</h2>
+  <div class="settings-row">
+    <label for="cgr-user">Username</label>
+    <input type="text" id="cgr-user" placeholder="user@example.com" autocomplete="username">
+    <label for="cgr-pass" style="margin-left:0.5rem">Password / Token</label>
+    <input type="password" id="cgr-pass" placeholder="••••••••" autocomplete="current-password">
+    <span class="settings-saved" id="saved-msg">Saved</span>
+  </div>
+</div>
+
+<main>
+  <form class="search-box" id="search-form">
+    <input type="text" id="pkg-input" placeholder="Package name (e.g. react, express, lodash)" autocomplete="off" spellcheck="false">
+    <button type="submit" id="fetch-btn">Fetch versions</button>
+  </form>
+
+  <div class="filter-row">
+    <label class="filter-label"><input type="checkbox" id="show-all"> Show all versions</label>
+    <label class="filter-label"><input type="checkbox" id="show-prerelease"> Show pre-release (alpha / beta / canary / rc)</label>
+  </div>
+
+  <div class="banners" id="banners"></div>
+
+  <div id="results">
+    <div id="status">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      Enter a package name above to compare versions
+    </div>
+  </div>
+</main>
+
+<script>
+const STORAGE_USER = 'npm-browser-cgr-user';
+const STORAGE_PASS = 'npm-browser-cgr-pass';
+
+// --- Settings ---
+const settingsBtn = document.getElementById('settings-btn');
+const settingsPanel = document.getElementById('settings-panel');
+const cgrUser = document.getElementById('cgr-user');
+const cgrPass = document.getElementById('cgr-pass');
+const savedMsg = document.getElementById('saved-msg');
+
+cgrUser.value = localStorage.getItem(STORAGE_USER) || '';
+cgrPass.value = localStorage.getItem(STORAGE_PASS) || '';
+
+settingsBtn.addEventListener('click', () => {
+  settingsPanel.classList.toggle('open');
+  settingsBtn.classList.toggle('active', settingsPanel.classList.contains('open'));
+});
+
+let saveTimer;
+function saveCredentials() {
+  localStorage.setItem(STORAGE_USER, cgrUser.value);
+  localStorage.setItem(STORAGE_PASS, cgrPass.value);
+  savedMsg.classList.add('show');
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => savedMsg.classList.remove('show'), 1800);
+}
+cgrUser.addEventListener('input', saveCredentials);
+cgrPass.addEventListener('input', saveCredentials);
+
+// --- Semver sort ---
+function semverParse(v) {
+  const [main = '', pre = ''] = v.split(/-(.+)/);
+  const parts = main.split('.').map(s => parseInt(s, 10) || 0);
+  return { parts, pre };
+}
+function semverCompare(a, b) {
+  const av = semverParse(a), bv = semverParse(b);
+  const len = Math.max(av.parts.length, bv.parts.length);
+  for (let i = 0; i < len; i++) {
+    const d = (av.parts[i] || 0) - (bv.parts[i] || 0);
+    if (d !== 0) return d;
+  }
+  if (av.pre && !bv.pre) return -1;
+  if (!av.pre && bv.pre) return 1;
+  if (av.pre && bv.pre) return av.pre < bv.pre ? -1 : av.pre > bv.pre ? 1 : 0;
+  return 0;
+}
+
+// --- Fetch ---
+async function fetchRegistry(url, headers = {}) {
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+async function lookupPackage(pkg) {
+  const user = localStorage.getItem(STORAGE_USER) || '';
+  const pass = localStorage.getItem(STORAGE_PASS) || '';
+
+  const npmUrl = `https://registry.npmjs.org/${encodeURIComponent(pkg)}`;
+  // Route cgr.dev through local proxy to avoid CORS issues
+  const cgrUrl = `/api/cgr/${encodeURIComponent(pkg)}`;
+  const cgrHeaders = user ? { 'x-cgr-user': user, 'x-cgr-pass': pass } : {};
+
+  const [npmRes, cgrRes] = await Promise.allSettled([
+    fetchRegistry(npmUrl),
+    fetchRegistry(cgrUrl, cgrHeaders),
+  ]);
+
+  const npmData = npmRes.status === 'fulfilled' ? npmRes.value : null;
+  const cgrData = cgrRes.status === 'fulfilled' ? cgrRes.value : null;
+  const npmError = npmRes.status === 'rejected' ? npmRes.reason : null;
+  const cgrError = cgrRes.status === 'rejected' ? cgrRes.reason : null;
+
+  const npmVersions = npmData?.versions || {};
+  const cgrVersions = cgrData?.versions || {};
+  const npmLatest = npmData?.['dist-tags']?.latest || null;
+  const npmTime = npmData?.time || {};
+
+  const allVersions = new Set([...Object.keys(npmVersions), ...Object.keys(cgrVersions)]);
+  const sorted = [...allVersions].sort(semverCompare).reverse();
+
+  return {
+    name: pkg,
+    latest: npmLatest,
+    rows: sorted.map(v => ({
+      version: v,
+      published: npmTime[v] || null,
+      npmTarball: npmVersions[v]?.dist?.tarball || null,
+      cgrTarball: cgrVersions[v]?.dist?.tarball || null,
+    })),
+    npmError,
+    cgrError,
+  };
+}
+
+// --- Filters ---
+let lastData = null;
+let lastSnapshot = null;
+const LIMIT = 50;
+const PRE_RE = /-(alpha|beta|canary|rc|next|dev|preview|experimental)\b/i;
+
+function applyFilters(rows) {
+  let out = rows;
+  if (!document.getElementById('show-prerelease').checked) {
+    out = out.filter(r => !r.version.includes('-'));
+  }
+  if (!document.getElementById('show-all').checked) {
+    out = out.slice(0, LIMIT);
+  }
+  return out;
+}
+
+document.getElementById('show-all').addEventListener('change', () => { if (lastData) renderTable(lastData); });
+document.getElementById('show-prerelease').addEventListener('change', () => { if (lastData) renderTable(lastData); });
+
+// --- Render ---
+function renderBanners(npmError, cgrError, pkg) {
+  const container = document.getElementById('banners');
+  container.innerHTML = '';
+  if (npmError) {
+    const b = document.createElement('div');
+    b.className = `banner ${npmError.status === 404 ? 'warn' : 'error'}`;
+    b.textContent = `npmjs.com: ${npmError.status === 404 ? `package "${pkg}" not found` : npmError.message}`;
+    container.appendChild(b);
+  }
+  if (cgrError) {
+    const b = document.createElement('div');
+    b.className = `banner ${cgrError.status === 401 ? 'error' : cgrError.status === 404 ? 'warn' : 'error'}`;
+    b.textContent = cgrError.status === 401
+      ? 'libraries.cgr.dev: Unauthorized — check credentials in Settings'
+      : cgrError.status === 404
+      ? `libraries.cgr.dev: package "${pkg}" not found`
+      : `libraries.cgr.dev: ${cgrError.message}`;
+    container.appendChild(b);
+  }
+}
+
+function renderTable(data) {
+  const { name, latest, rows: allRows } = data;
+  const resultsEl = document.getElementById('results');
+  const rows = applyFilters(allRows);
+
+  if (allRows.length === 0) {
+    resultsEl.innerHTML = `<div id="status">No versions found for <strong>${escHtml(name)}</strong></div>`;
+    return;
+  }
+
+  const total = rows.length;
+  const npmCount = rows.filter(r => r.npmTarball).length;
+  const cgrBuilt   = rows.filter(r => r.cgrTarball && r.cgrTarball.includes('cgr.dev/javascript/') && !r.cgrTarball.includes('javascript-upstream')).length;
+  const cgrMirror  = rows.filter(r => r.cgrTarball && r.cgrTarball.includes('javascript-upstream')).length;
+  const cgrCount   = cgrBuilt + cgrMirror;
+  const countNote  = total < allRows.length ? `showing ${total} of ${allRows.length}` : `${total} version${total !== 1 ? 's' : ''}`;
+
+  const pct = (n, d) => d ? Math.round(n / d * 100) : 0;
+  const cgrPct    = pct(cgrCount, total);
+  const builtPct  = pct(cgrBuilt, cgrCount);
+  const mirrorPct = pct(cgrMirror, cgrCount);
+
+  let html = `
+    <div class="results-header">
+      <div class="results-title">
+        <a class="pkg-name" href="https://www.npmjs.com/package/${encodeURIComponent(name)}?activeTab=versions" target="_blank" rel="noopener">${escHtml(name)}</a>
+        <span class="count">${escHtml(countNote)}</span>
+      </div>
+      <div class="header-right">
+      <div class="stats-row">
+        <div class="stat-block">
+          <span class="stat-label">npmjs.com</span>
+          <span class="stat-value">${npmCount}</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-block">
+          <span class="stat-label">In Chainguard</span>
+          <span class="stat-value">${cgrCount} <span class="stat-pct">${cgrPct}%</span></span>
+        </div>
+        <div class="stat-block stat-sub">
+          <span class="stat-label">Built</span>
+          <span class="stat-value">${cgrBuilt} <span class="stat-pct built">${builtPct}%</span></span>
+        </div>
+        <div class="stat-block stat-sub">
+          <span class="stat-label">Mirrored</span>
+          <span class="stat-value">${cgrMirror} <span class="stat-pct mirror">${mirrorPct}%</span></span>
+        </div>
+      </div>
+      <button id="copy-btn" onclick="copyResults()">Copy results</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Version</th>
+          <th>Published</th>
+          <th style="text-align:center">npmjs.com</th>
+          <th style="text-align:center">Chainguard</th>
+        </tr>
+      </thead>
+      <tbody>
+  `;
+
+  for (const row of rows) {
+    const isLatest = row.version === latest;
+    html += `<tr${isLatest ? ' class="latest"' : ''}>`;
+    html += `<td><div class="version-cell"><code>${escHtml(row.version)}</code>${isLatest ? '<span class="badge-latest">latest</span>' : ''}</div></td>`;
+    html += `<td class="date-cell">${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
+    html += `<td class="check-cell">${tarballCell(row.npmTarball)}</td>`;
+    html += `<td class="check-cell">${tarballCell(row.cgrTarball, true)}</td>`;
+    html += `</tr>`;
+  }
+
+  html += `</tbody></table></div>`;
+  resultsEl.innerHTML = html;
+
+  lastSnapshot = { name, countNote, total, npmCount, cgrCount, cgrPct, cgrBuilt, builtPct, cgrMirror, mirrorPct, rows, latest };
+}
+
+function tarballCell(url, isCgr = false) {
+  if (!url) return `<span class="cross" title="Not available">✗</span>`;
+  let badge = '';
+  if (isCgr) {
+    if (url.includes('libraries.cgr.dev/javascript-upstream/')) {
+      badge = `<span class="cgr-badge mirror" title="Mirrored from upstream">Secure Mirror</span>`;
+    } else if (url.includes('libraries.cgr.dev/javascript/')) {
+      badge = `<span class="cgr-badge built" title="Built by Chainguard">Built</span>`;
+    }
+  }
+  return `<span class="check-wrap"><a class="check-link" href="${escHtml(url)}" target="_blank" rel="noopener" title="${escHtml(url)}">✓</a>${badge}</span>`;
+}
+
+const dateFmt = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+function formatDate(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const days = Math.floor((Date.now() - d) / 86400000);
+  return `${dateFmt.format(d)} (${days}d ago)`;
+}
+
+function cgrTextLabel(url) {
+  if (!url) return '✗';
+  if (url.includes('javascript-upstream')) return '✓ Mirror';
+  if (url.includes('cgr.dev/javascript/')) return '✓ Built';
+  return '✓';
+}
+
+function copyResults() {
+  if (!lastSnapshot) return;
+  const { name, countNote, total, npmCount, cgrCount, cgrPct, cgrBuilt, builtPct, cgrMirror, mirrorPct, rows, latest } = lastSnapshot;
+
+  const lines = [];
+  lines.push(`${name} — ${countNote}`);
+  lines.push(`npmjs.com: ${npmCount}  |  Chainguard: ${cgrPct}% (${cgrCount}/${total})  |  Built: ${builtPct}% (${cgrBuilt}/${cgrCount})  |  Mirrored: ${mirrorPct}% (${cgrMirror}/${cgrCount})`);
+  lines.push('');
+
+  const vw = Math.max(7, ...rows.map(r => r.version.length + (r.version === latest ? 9 : 0))) + 2;
+  lines.push('Version'.padEnd(vw) + 'npmjs.com'.padEnd(12) + 'Chainguard');
+  lines.push('─'.repeat(vw + 22));
+
+  for (const row of rows) {
+    const v = row.version + (row.version === latest ? ' (latest)' : '');
+    lines.push(v.padEnd(vw) + (row.npmTarball ? '✓' : '✗').padEnd(12) + cgrTextLabel(row.cgrTarball));
+  }
+
+  navigator.clipboard.writeText(lines.join('\n')).then(() => {
+    const btn = document.getElementById('copy-btn');
+    if (!btn) return;
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy results'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function showLoading(pkg) {
+  document.getElementById('results').innerHTML = `
+    <div id="status">
+      <div class="spinner"></div>
+      Fetching versions for <strong>${escHtml(pkg)}</strong>…
+    </div>`;
+  document.getElementById('banners').innerHTML = '';
+}
+
+// --- Search form ---
+document.getElementById('search-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const pkg = document.getElementById('pkg-input').value.trim();
+  if (!pkg) return;
+
+  const btn = document.getElementById('fetch-btn');
+  btn.disabled = true;
+  showLoading(pkg);
+
+  try {
+    const data = await lookupPackage(pkg);
+    lastData = data;
+    renderBanners(data.npmError, data.cgrError, pkg);
+    renderTable(data);
+  } catch (err) {
+    document.getElementById('results').innerHTML = `
+      <div id="status">Unexpected error: ${escHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('pkg-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') e.target.form.requestSubmit();
+});
+</script>
+</body>
+</html>
