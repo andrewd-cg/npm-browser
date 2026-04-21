@@ -5,4 +5,4 @@ runs:
   steps:
     - uses: chainguard-dev/setup-chainctl@v0.4.0
       with:
-        identity: 9188682cf9821b6157bb8a00d8376efc4a2933e3/4d33bc79b6a25a2e
+        identity: 9188682cf9821b6157bb8a00d8376efc4a2933e3/22de847855b00046
