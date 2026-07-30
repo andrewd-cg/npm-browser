@@ -3250,7 +3250,20 @@ function scanParse(text) {
     return { error: 'This JSON does not look like a package-lock.json (no lockfileVersion / packages / dependencies).' };
   }
   if (trimmed.includes('[[package]]')) return scanParsePoetry(trimmed);
+  // yarn classic has "# yarn lockfile v1"; yarn berry starts with "__metadata:"
+  // Fallback heuristic: indented version lines with quotes are yarn classic
+  if (trimmed.includes('# yarn lockfile') || trimmed.startsWith('__metadata:') ||
+      /\n  version "[^"]+"/.test(trimmed)) return scanParseYarnLock(trimmed);
   return scanParseRequirements(trimmed);
+}
+
+function scanParseYarnLock(text) {
+  const parsed = parseYarnLock(text);
+  if (!parsed || !parsed.packages.length) return { error: 'No packages found in yarn.lock.' };
+  const out = parsed.packages.map(({ name, requestedVersion }) => ({
+    name, version: requestedVersion, resolved: null, integrity: null, dev: false,
+  }));
+  return { ecosystem: 'npm', packages: out };
 }
 
 function scanParseNpmLock(obj) {
