@@ -471,7 +471,7 @@ const statsCache = new Map(); // key → { result, expiresAt }
 const STATS_TTL = 30000; // 30 seconds
 
 Bun.serve({
-  port: 3000,
+  port: Number(process.env.PORT) || 3000,
   idleTimeout: 60,
   async fetch(req) {
     const url = new URL(req.url);
@@ -702,6 +702,43 @@ Bun.serve({
         return new Response(body, { status: res.status, headers: { 'Content-Type': 'application/xml' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // Maven built-from-source versions via the Libraries catalog (console-api).
+    // This is the authoritative source of what Chainguard actually builds from
+    // source; the /java/ and /java-upstream/ maven-metadata.xml are a merged
+    // serving view and cannot distinguish built vs proxied. Uses the platform
+    // token (audience console-api.enforce.dev) — same one malware sync uses.
+    if (url.pathname === '/api/cgr-java-catalog') {
+      const group = url.searchParams.get('group');
+      const artifact = url.searchParams.get('artifact');
+      if (!group || !artifact) return new Response('Missing group or artifact', { status: 400 });
+      if (!platformToken) {
+        return new Response(JSON.stringify({ versions: [], authRequired: true }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      const id = `maven:${group}:${artifact}`;
+      const base = `https://console-api.enforce.dev/libraries/v1/artifacts/${encodeURIComponent(id)}/versions`;
+      try {
+        const versions = [];
+        let pageToken = '';
+        for (let i = 0; i < 50; i++) { // safety cap against a runaway paging loop
+          const params = new URLSearchParams({ page_size: '1000' });
+          if (pageToken) params.set('page_token', pageToken);
+          const res = await fetch(`${base}?${params}`, { headers: { Authorization: `Bearer ${platformToken}` } });
+          if (res.status === 404) break; // not in catalog → no built-from-source versions
+          if (!res.ok) {
+            const text = await res.text();
+            return new Response(JSON.stringify({ versions: [], error: `console-api HTTP ${res.status}: ${text.slice(0, 200)}` }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+          }
+          const data = await res.json();
+          for (const it of (data.items || [])) if (it.version) versions.push(it.version);
+          pageToken = data.nextPageToken || data.next_page_token || '';
+          if (!pageToken) break;
+        }
+        return new Response(JSON.stringify({ versions }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ versions: [], error: err.message }), { status: 502, headers: { 'Content-Type': 'application/json' } });
       }
     }
 
@@ -1060,6 +1097,6 @@ Bun.serve({
   },
 });
 
-console.log('Listening on http://localhost:3000');
+console.log(`Listening on http://localhost:${Number(process.env.PORT) || 3000}`);
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));

@@ -412,6 +412,7 @@
     flex-wrap: wrap;
   }
   .results-title { display: flex; align-items: baseline; gap: 0.6rem; }
+  .results-title.stacked { flex-direction: column; align-items: flex-start; gap: 0.15rem; }
   .results-header .pkg-name { font-weight: 600; font-size: 1rem; color: #1a1a2e; text-decoration: none; }
   .results-header .pkg-name:hover { text-decoration: underline; color: #2563eb; }
   .results-header .pkg-name.mono { font-family: 'SFMono-Regular', Consolas, monospace; }
@@ -435,6 +436,11 @@
   .stat-pct.built  { color: #1d4ed8; }
   .stat-pct.mirror { color: #7e22ce; }
   .stat-divider { width: 1px; height: 32px; background: #e2e8f0; margin: 0 0.25rem; }
+  .stat-block.stat-clickable { cursor: pointer; transition: background 0.12s, box-shadow 0.12s; }
+  .stat-block.stat-clickable:hover { background: #eef2ff; }
+  .stat-block.stat-active { background: #e0e7ff; border-color: #a5b4fc; box-shadow: 0 0 0 1px #a5b4fc inset; }
+  .filter-chip { font: inherit; font-size: 0.8rem; color: #4338ca; background: #e0e7ff; border: 1px solid #c7d2fe; border-radius: 999px; padding: 1px 8px; cursor: pointer; }
+  .filter-chip:hover { background: #c7d2fe; }
 
   .header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; }
   .copy-btn {
@@ -1303,30 +1309,29 @@ function integrityCell(npmI, cgrI) {
   return `<div class="integrity-cell">${body}</div>`;
 }
 
-function statsHtml(registry1Label, r1Count, cgrCount, total, cgrBuilt, cgrMirror) {
+function statsHtml(registry1Label, r1Count, cgrCount, total, cgrBuilt, cgrMirror, opts = {}) {
+  // All percentages are relative to the full version total (coverage), so
+  // In Chainguard = Built + Scanned rather than Built/Scanned being a confusing
+  // sub-split of the Chainguard count.
+  // opts.filterable makes each box a clickable filter (data-stat), opts.active
+  // highlights the currently-selected one. Off by default → npm/pypi unchanged.
+  const { filterable = false, active = null } = opts;
   const pct = (n, d) => d ? Math.round(n / d * 100) : 0;
   const cgrPct    = pct(cgrCount, total);
-  const builtPct  = pct(cgrBuilt, cgrCount);
-  const mirrorPct = pct(cgrMirror, cgrCount);
+  const builtPct  = pct(cgrBuilt, total);
+  const mirrorPct = pct(cgrMirror, total);
+  const block = (key, sub, inner) => {
+    const cls = `stat-block${sub ? ' stat-sub' : ''}${filterable ? ' stat-clickable' : ''}${active === key ? ' stat-active' : ''}`;
+    const attr = filterable ? ` data-stat="${key}" role="button" tabindex="0" title="Filter to these versions"` : '';
+    return `<div class="${cls}"${attr}>${inner}</div>`;
+  };
   return { cgrPct, builtPct, mirrorPct, html: `
     <div class="stats-row">
-      <div class="stat-block">
-        <span class="stat-label">${escHtml(registry1Label)}</span>
-        <span class="stat-value">${r1Count}</span>
-      </div>
+      ${block('registry', false, `<span class="stat-label">${escHtml(registry1Label)}</span><span class="stat-value">${r1Count}</span>`)}
       <div class="stat-divider"></div>
-      <div class="stat-block">
-        <span class="stat-label">In Chainguard</span>
-        <span class="stat-value">${cgrCount} <span class="stat-pct">${cgrPct}%</span></span>
-      </div>
-      <div class="stat-block stat-sub">
-        <span class="stat-label">Built from Source</span>
-        <span class="stat-value">${cgrBuilt} <span class="stat-pct built">${builtPct}%</span></span>
-      </div>
-      <div class="stat-block stat-sub">
-        <span class="stat-label">Scanned Upstream</span>
-        <span class="stat-value">${cgrMirror} <span class="stat-pct mirror">${mirrorPct}%</span></span>
-      </div>
+      ${block('cgr', false, `<span class="stat-label">In Chainguard</span><span class="stat-value">${cgrCount} <span class="stat-pct">${cgrPct}%</span></span>`)}
+      ${block('built', true, `<span class="stat-label">Built from Source</span><span class="stat-value">${cgrBuilt} <span class="stat-pct built">${builtPct}%</span></span>`)}
+      ${block('mirror', true, `<span class="stat-label">Scanned Upstream</span><span class="stat-value">${cgrMirror} <span class="stat-pct mirror">${mirrorPct}%</span></span>`)}
     </div>`
   };
 }
@@ -1577,7 +1582,7 @@ tabBtns.forEach(btn => {
 
 const state = {
   npm:   { lastData: null, lastSnapshot: null, sort: { key: 'version', dir: -1 } },
-  maven: { lastData: null, lastSnapshot: null, sort: { key: 'version', dir: -1 } },
+  maven: { lastData: null, lastSnapshot: null, sort: { key: 'version', dir: -1 }, statFilter: null },
   pypi:  { lastData: null, lastSnapshot: null, sort: { key: 'version', dir: -1 } },
   bulk:  { lastData: null,                     sort: { key: 'pkg',     dir:  1 } },
   scan:  { packages: null },
@@ -2028,6 +2033,16 @@ async function mavenFetchCgr(group, artifact, repo) {
   return res.text();
 }
 
+// Built-from-source versions from the Libraries catalog (authoritative — the
+// maven-metadata.xml on /java/ is a merged view and can't distinguish built
+// from proxied-upstream). Returns { versions, authRequired?, error? }.
+async function mavenFetchCatalog(group, artifact) {
+  const res = await fetch(`/api/cgr-java-catalog?${new URLSearchParams({ group, artifact })}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { const e = new Error(data.error || `HTTP ${res.status}`); e.status = res.status; throw e; }
+  return data;
+}
+
 function updateStep(id, s) {
   const el = document.getElementById(id);
   if (el) el.querySelector('.step-icon').className = `step-icon ${s}`;
@@ -2041,8 +2056,6 @@ function mavenShowLoading(name) {
         <div class="fetch-step" id="step-maven"><span class="step-icon pending"></span>Maven Central (versions)</div>
         <div class="fetch-step" id="step-built"><span class="step-icon pending"></span>Chainguard Built</div>
         <div class="fetch-step" id="step-mirror"><span class="step-icon pending"></span>Chainguard Mirror</div>
-        <div class="fetch-step" id="step-timestamps"><span class="step-icon pending"></span><span id="ts-label">Publish dates</span></div>
-        <div class="fetch-step" id="step-fallback"><span class="step-icon pending"></span><span id="fb-label">Publish dates (recent)</span></div>
       </div>
     </div>`;
   document.getElementById('maven-banners').innerHTML = '';
@@ -2057,8 +2070,8 @@ async function mavenLookup(group, artifact) {
   const malPkg = `${group}/${artifact}`;
   const [mvnMetaRes, cgrBuiltRes, cgrMirrorRes, malRes] = await Promise.allSettled([
     track(mavenFetchMetadata(group, artifact), 'step-maven'),
-    track(mavenFetchCgr(group, artifact, 'java'), 'step-built'),
-    track(mavenFetchCgr(group, artifact, 'java-upstream'), 'step-mirror'),
+    track(mavenFetchCatalog(group, artifact), 'step-built'),
+    track(mavenFetchCgr(group, artifact, 'java'), 'step-mirror'),
     fetch(`/api/cgr-malware/check?package=${encodeURIComponent(malPkg)}&eco=maven`).then(r => r.json()),
   ]);
 
@@ -2070,7 +2083,11 @@ async function mavenLookup(group, artifact) {
     || mvnXmlDoc?.querySelector('versioning > latest')?.textContent?.trim()
     || mvnAllVersions.at(-1) || null;
 
-  const cgrBuiltVersions  = cgrBuiltRes.status  === 'fulfilled' ? new Set(parseMetadataXml(cgrBuiltRes.value))  : new Set();
+  const catalog = cgrBuiltRes.status === 'fulfilled' ? cgrBuiltRes.value : { versions: [] };
+  const cgrBuiltVersions  = new Set(catalog.versions || []);
+  // /java/ is the unified mirror index (built ∪ upstream). A version here that
+  // isn't in the built catalog is a scanned-upstream ('mirror') version — the
+  // cgrType logic below applies built-first, so the overlap resolves correctly.
   const cgrMirrorVersions = cgrMirrorRes.status === 'fulfilled' ? new Set(parseMetadataXml(cgrMirrorRes.value)) : new Set();
 
   const malRows = malRes.status === 'fulfilled' ? (malRes.value.rows || []) : [];
@@ -2089,33 +2106,52 @@ async function mavenLookup(group, artifact) {
     rows: sorted.map(v => ({
       version: v, published: null,
       inMvn: mvnVersionSet.has(v),
-      cgrType: (cgrBuiltVersions.has(v) && !cgrMirrorVersions.has(v)) ? 'built' : cgrMirrorVersions.has(v) ? 'mirror' : null,
+      cgrType: cgrBuiltVersions.has(v) ? 'built' : cgrMirrorVersions.has(v) ? 'mirror' : null,
       malware: malByVersion.get(v) || (malPackageWide[0] ? { ...malPackageWide[0], _packageWide: true } : null),
     })),
     mvnError: mvnMetaRes.status === 'rejected' ? mvnMetaRes.reason : null,
     cgrBuiltError:  cgrBuiltRes.status  === 'rejected' ? cgrBuiltRes.reason  : null,
     cgrMirrorError: cgrMirrorRes.status === 'rejected' ? cgrMirrorRes.reason : null,
+    catalogAuthRequired: catalog.authRequired === true,
+    catalogError: catalog.error || null,
     malwarePackageWide: malPackageWide,
   };
 }
 
+// Top-right stat boxes double as quick filters: each maps to a row predicate.
+const MAVEN_STAT_PRED = {
+  registry: r => r.inMvn,
+  cgr:      r => !!r.cgrType,
+  built:    r => r.cgrType === 'built',
+  mirror:   r => r.cgrType === 'mirror',
+};
+const MAVEN_STAT_LABELS = { registry: 'Maven Central', cgr: 'In Chainguard', built: 'Built from Source', mirror: 'Scanned Upstream' };
+
 function mavenApplyFilters(rows) {
   let out = rows;
+  const sf = state.maven.statFilter;
+  if (sf && MAVEN_STAT_PRED[sf]) out = out.filter(MAVEN_STAT_PRED[sf]);
   if (!document.getElementById('maven-show-prerelease').checked) out = out.filter(r => !mavenIsPrerelease(r.version));
   if (!document.getElementById('maven-show-all').checked) out = out.slice(0, 50);
   return out;
 }
 
 function mavenRenderBanners(data) {
-  const { name, mvnError, cgrBuiltError, cgrMirrorError } = data;
+  const { name, mvnError, cgrBuiltError, cgrMirrorError, catalogAuthRequired, catalogError } = data;
   const container = document.getElementById('maven-banners');
   container.innerHTML = '';
   const add = (cls, msg) => { const b = document.createElement('div'); b.className = `banner ${cls}`; b.textContent = msg; container.appendChild(b); };
   if (mvnError) add(mvnError.status === 404 ? 'warn' : 'error', `Maven Central: ${mvnError.status === 404 ? `"${name}" not found` : mvnError.message}`);
-  if (cgrBuiltError && cgrBuiltError.status !== 404)
-    add(cgrBuiltError.status === 401 ? 'error' : 'warn', cgrBuiltError.status === 401 ? 'libraries.cgr.dev: Unauthorized — check credentials in Settings' : `libraries.cgr.dev (java): ${cgrBuiltError.message}`);
-  if (cgrMirrorError && cgrMirrorError.status !== 404 && (!cgrBuiltError || cgrBuiltError.status === 404))
-    add('warn', `libraries.cgr.dev (java-upstream): ${cgrMirrorError.message}`);
+  // Chainguard registry (java) — authenticated with the Maven pull token from Settings
+  if (cgrMirrorError && cgrMirrorError.status !== 404)
+    add(cgrMirrorError.status === 401 ? 'error' : 'warn', cgrMirrorError.status === 401 ? 'libraries.cgr.dev: Unauthorized — check Maven credentials in Settings' : `libraries.cgr.dev (java): ${cgrMirrorError.message}`);
+  // Built-from-source catalog (console-api) — authenticated with the platform token
+  if (catalogAuthRequired)
+    add('warn', 'Built-from-Source detection needs a platform token — set one in Settings. Versions are shown as Scanned Upstream where the mirror has them.');
+  else if (catalogError)
+    add('warn', `Libraries catalog: ${catalogError}`);
+  else if (cgrBuiltError)
+    add('warn', `Libraries catalog: ${cgrBuiltError.message}`);
 }
 
 function mavenRenderTable(data) {
@@ -2128,20 +2164,27 @@ function mavenRenderTable(data) {
     return;
   }
 
-  const total      = rows.length;
-  const mvnCount   = rows.filter(r => r.inMvn).length;
-  const cgrBuilt   = rows.filter(r => r.cgrType === 'built').length;
-  const cgrMirror  = rows.filter(r => r.cgrType === 'mirror').length;
+  // Stats cover the full result set (respecting the pre-release filter but NOT
+  // the top-50 display cap), so percentages reflect real coverage rather than
+  // whatever slice happens to be visible.
+  const statRows = document.getElementById('maven-show-prerelease').checked
+    ? allRows : allRows.filter(r => !mavenIsPrerelease(r.version));
+  const total      = statRows.length;
+  const mvnCount   = statRows.filter(r => r.inMvn).length;
+  const cgrBuilt   = statRows.filter(r => r.cgrType === 'built').length;
+  const cgrMirror  = statRows.filter(r => r.cgrType === 'mirror').length;
   const cgrCount   = cgrBuilt + cgrMirror;
-  const countNote  = total < allRows.length ? `showing ${total} of ${allRows.length}` : `${total} version${total !== 1 ? 's' : ''}`;
-  const { cgrPct, builtPct, mirrorPct, html: statsH } = statsHtml('Maven Central', mvnCount, cgrCount, total, cgrBuilt, cgrMirror);
+  const sf = state.maven.statFilter;
+  const filterTotal = sf && MAVEN_STAT_PRED[sf] ? statRows.filter(MAVEN_STAT_PRED[sf]).length : total;
+  const countNote  = rows.length < filterTotal ? `showing ${rows.length} of ${filterTotal}` : `${filterTotal} version${filterTotal !== 1 ? 's' : ''}`;
+  const { cgrPct, builtPct, mirrorPct, html: statsH } = statsHtml('Maven Central', mvnCount, cgrCount, total, cgrBuilt, cgrMirror, { filterable: true, active: sf });
   const mvnSearchUrl = `https://search.maven.org/artifact/${encodeURIComponent(group)}/${encodeURIComponent(artifact)}`;
 
   let html = `
     <div class="results-header">
-      <div class="results-title">
+      <div class="results-title stacked">
         <a class="pkg-name mono" href="${escHtml(mvnSearchUrl)}" target="_blank" rel="noopener">${escHtml(name)}</a>
-        <span class="count">${escHtml(countNote)}</span>
+        <span class="count">${escHtml(countNote)}${sf ? ` · <button class="filter-chip" data-clear-stat title="Clear filter">${escHtml(MAVEN_STAT_LABELS[sf])} ✕</button>` : ''}${data.datesLoading ? ' · <span style="opacity:.65">loading publish dates…</span>' : ''}</span>
       </div>
       <div class="header-right">
         ${statsH}
@@ -2156,7 +2199,7 @@ function mavenRenderTable(data) {
   for (const row of rows) {
     const isLatest = row.version === latest;
     const mvnUrl = row.inMvn ? `https://search.maven.org/artifact/${encodeURIComponent(group)}/${encodeURIComponent(artifact)}/${encodeURIComponent(row.version)}/jar` : null;
-    const cgrUrl = row.cgrType ? `https://libraries.cgr.dev/${row.cgrType === 'built' ? 'java' : 'java-upstream'}/${group.replace(/\./g,'/')}/${artifact}/${row.version}/${artifact}-${row.version}.pom` : null;
+    const cgrUrl = row.cgrType ? `https://libraries.cgr.dev/java/${group.replace(/\./g,'/')}/${artifact}/${row.version}/${artifact}-${row.version}.pom` : null;
     html += `<tr${isLatest ? ' class="latest"' : ''}>`;
     html += `<td><div class="version-cell"><code>${escHtml(row.version)}</code>${isLatest ? '<span class="badge-latest">latest</span>' : ''}${showMalware ? malwareBadgeHtml(row.malware) : ''}</div></td>`;
     html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
@@ -2176,7 +2219,7 @@ function mavenCopyResults() {
   const { name, countNote, total, mvnCount, cgrCount, cgrPct, cgrBuilt, builtPct, cgrMirror, mirrorPct, rows, latest } = s;
   const lines = [
     `${name} — ${countNote}`,
-    `Maven Central: ${mvnCount}  |  Chainguard: ${cgrPct}% (${cgrCount}/${total})  |  Built from Source: ${builtPct}% (${cgrBuilt}/${cgrCount})  |  Scanned Upstream: ${mirrorPct}% (${cgrMirror}/${cgrCount})`,
+    `Maven Central: ${mvnCount}  |  Chainguard: ${cgrPct}% (${cgrCount}/${total})  |  Built from Source: ${builtPct}% (${cgrBuilt}/${total})  |  Scanned Upstream: ${mirrorPct}% (${cgrMirror}/${total})`,
     '',
   ];
   const vw = Math.max(7, ...rows.map(r => r.version.length + (r.version === latest ? 9 : 0))) + 2;
@@ -2193,6 +2236,24 @@ document.getElementById('maven-show-all').addEventListener('change', () => { if 
 document.getElementById('maven-show-prerelease').addEventListener('change', () => { if (state.maven.lastData) mavenRenderTable(state.maven.lastData); });
 document.getElementById('maven-show-malware').addEventListener('change', () => { if (state.maven.lastData) mavenRenderTable(state.maven.lastData); });
 
+// Clicking a top-right stat box filters the table to those versions (toggle);
+// the ✕ chip clears it. Delegated so it survives table re-renders.
+function mavenToggleStatFilter(key) {
+  if (!state.maven.lastData) return;
+  state.maven.statFilter = state.maven.statFilter === key ? null : key;
+  mavenRenderTable(state.maven.lastData);
+}
+document.getElementById('maven-results').addEventListener('click', (e) => {
+  if (e.target.closest('[data-clear-stat]')) { state.maven.statFilter = null; if (state.maven.lastData) mavenRenderTable(state.maven.lastData); return; }
+  const box = e.target.closest('.stat-clickable[data-stat]');
+  if (box) mavenToggleStatFilter(box.dataset.stat);
+});
+document.getElementById('maven-results').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const box = e.target.closest('.stat-clickable[data-stat]');
+  if (box) { e.preventDefault(); mavenToggleStatFilter(box.dataset.stat); }
+});
+
 document.getElementById('maven-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const raw = document.getElementById('maven-input').value.trim();
@@ -2205,26 +2266,45 @@ document.getElementById('maven-form').addEventListener('submit', async (e) => {
   const [group, artifact] = parts.map(s => s.trim());
   const btn = document.getElementById('maven-btn');
   btn.disabled = true;
+  state.maven.statFilter = null; // fresh lookup clears any active box filter
   mavenShowLoading(`${group}:${artifact}`);
 
   try {
-    const [data, timestamps] = await Promise.all([
-      mavenLookup(group, artifact),
-      mavenFetchTimestamps(group, artifact, (received, total) => {
-        const label = document.getElementById('ts-label');
-        if (label) label.textContent = `Publish dates (${received} / ${total})`;
-      }).then(ts => { updateStep('step-timestamps', 'done'); return ts; })
-        .catch(() => { updateStep('step-timestamps', 'fail'); return {}; }),
-    ]);
+    // Render the table as soon as the versions + built/upstream status are in;
+    // publish dates are fetched separately and filled in afterwards.
+    const data = await mavenLookup(group, artifact);
+    data.datesLoading = data.rows.some(r => r.inMvn);
+    state.maven.lastData = data;
+    mavenRenderBanners(data);
+    mavenRenderTable(data);
 
-    for (const row of data.rows) {
-      if (timestamps[row.version]) row.published = timestamps[row.version];
-    }
+    // Fire-and-forget: fetch publish dates and re-render as they arrive.
+    mavenFillPublishDates(group, artifact, data).catch(() => {});
+  } catch (err) {
+    document.getElementById('maven-results').innerHTML = `<div class="status-placeholder">Unexpected error: ${escHtml(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
+// Fetches Maven Central publish dates in the background and fills them into the
+// already-rendered table, re-rendering as each source completes. Guards against
+// a stale run clobbering a newer search's results.
+async function mavenFillPublishDates(group, artifact, data) {
+  const isStale = () => state.maven.lastData !== data;
+  try {
+    // Solr search index (bulk, all versions)
+    try {
+      const timestamps = await mavenFetchTimestamps(group, artifact);
+      if (isStale()) return;
+      let changed = false;
+      for (const row of data.rows) if (timestamps[row.version]) { row.published = timestamps[row.version]; changed = true; }
+      if (changed) mavenRenderTable(data);
+    } catch { /* fall through to per-version fallback */ }
+
+    // Fallback: resolve any Maven Central versions the search index didn't cover
     const missing = data.rows.filter(r => r.inMvn && !r.published).map(r => r.version);
-    if (missing.length > 0) {
-      const fbLabel = document.getElementById('fb-label');
-      if (fbLabel) fbLabel.textContent = `Publish dates (${missing.length} recent)`;
+    if (!isStale() && missing.length > 0) {
       try {
         const res = await fetch('/api/maven-dates', {
           method: 'POST',
@@ -2232,22 +2312,16 @@ document.getElementById('maven-form').addEventListener('submit', async (e) => {
           body: JSON.stringify({ group, artifact, versions: missing }),
         });
         const fallback = await res.json();
-        for (const row of data.rows) { if (fallback[row.version]) row.published = fallback[row.version]; }
-        updateStep('step-fallback', 'done');
-      } catch { updateStep('step-fallback', 'fail'); }
-    } else {
-      updateStep('step-fallback', 'done');
+        if (isStale()) return;
+        let changed = false;
+        for (const row of data.rows) if (fallback[row.version]) { row.published = fallback[row.version]; changed = true; }
+        if (changed) mavenRenderTable(data);
+      } catch { /* leave as — */ }
     }
-
-    state.maven.lastData = data;
-    mavenRenderBanners(data);
-    mavenRenderTable(data);
-  } catch (err) {
-    document.getElementById('maven-results').innerHTML = `<div class="status-placeholder">Unexpected error: ${escHtml(err.message)}</div>`;
   } finally {
-    btn.disabled = false;
+    if (!isStale()) { data.datesLoading = false; mavenRenderTable(data); }
   }
-});
+}
 
 // ── pypi tab ──────────────────────────────────────────────────────────────────
 
