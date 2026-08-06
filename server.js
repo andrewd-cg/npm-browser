@@ -314,149 +314,152 @@ function insertItems(items, ecoName) {
   syncState.fetched += items.length;
 }
 
+const MALWARE_API_BASE = 'https://console-api.enforce.dev/libraries/v1/malware/blocklist';
+const MALWARE_EPOCH = '2026-01-01T00:00:00Z';
+// Identity key matching the malware PRIMARY KEY (normalised the same way insertItems stores).
+const malKey = (pkg, ver, malid, blockedAt) => `${pkg} ${ver ?? ''} ${malid ?? ''} ${blockedAt}`;
+
+// GET one blocklist page with 401→chainctl-refresh and transient-5xx/429 retry. Returns parsed JSON.
+async function malwareApiGet(params, ctx = '') {
+  for (let attempt = 1; ; attempt++) {
+    let res = await fetch(`${MALWARE_API_BASE}?${params}`, { headers: { Authorization: `Bearer ${platformToken}` } });
+    if (res.status === 401) {
+      console.log(`Token expired mid-sync${ctx ? ` (${ctx})` : ''}, attempting chainctl refresh…`);
+      const refreshed = await refreshPlatformTokenViaChainctl();
+      if (!refreshed) throw new Error('HTTP 401 from Platform API — token expired and chainctl refresh failed');
+      res = await fetch(`${MALWARE_API_BASE}?${params}`, { headers: { Authorization: `Bearer ${platformToken}` } });
+    }
+    if (res.ok) return res.json();
+
+    // Non-OK: capture body + context so recurrences are diagnosable.
+    const bodyText = await res.text().catch(() => '<unreadable body>');
+    const reqId = res.headers.get('x-request-id') || res.headers.get('x-amzn-requestid') || res.headers.get('cf-ray') || null;
+    console.error(`[malware-sync] HTTP ${res.status} from Platform API — ${ctx}${reqId ? ` reqId=${reqId}` : ''}\n  url:  ${MALWARE_API_BASE}?${params}\n  body: ${bodyText.slice(0, 1000)}`);
+    if ((res.status >= 500 || res.status === 429) && attempt <= 3) {
+      const backoff = 1000 * attempt;
+      console.warn(`[malware-sync] transient ${res.status}, retrying in ${backoff}ms (attempt ${attempt}/3)…`);
+      await new Promise(r => setTimeout(r, backoff));
+      continue;
+    }
+    let msg = `HTTP ${res.status} from Platform API`;
+    if (bodyText && bodyText !== '<unreadable body>') msg += `: ${bodyText.slice(0, 300)}`;
+    throw new Error(msg);
+  }
+}
+
+// Authoritative count of entries with blocked_at >= since (the API respects `since`, ignores `until`).
+async function malwareTotalCountSince(apiName, since) {
+  const data = await malwareApiGet(new URLSearchParams({ ecosystem: apiName, pageSize: '1', since }), `${apiName} count ${since.slice(0, 10)}`);
+  return Number(data.totalCount || 0);
+}
+
+// Page through every entry with blocked_at >= since (newest-first), invoking onPage(items) per page.
+async function malwarePageThrough(apiName, since, onPage) {
+  let pageToken = null;
+  while (!syncState.cancelled) {
+    const params = new URLSearchParams({ ecosystem: apiName, pageSize: '500', since });
+    if (pageToken) params.set('pageToken', pageToken);
+    const data = await malwareApiGet(params, `${apiName} since=${since}`);
+    const items = data.items || [];
+    onPage(items);
+    if (!data.nextPageToken || items.length === 0) break;
+    pageToken = data.nextPageToken;
+  }
+}
+
+// Monthly boundaries [epoch, …, now+1d] used to localise which month(s) changed.
+function malwareMonthBoundaries() {
+  const bs = [];
+  let cursor = new Date(MALWARE_EPOCH);
+  const end = new Date(Date.now() + 86400000);
+  while (cursor < end) { bs.push(cursor.toISOString()); const n = new Date(cursor); n.setUTCMonth(n.getUTCMonth() + 1); cursor = n; }
+  bs.push(end.toISOString());
+  return bs;
+}
+
+// The delta add-pass only inserts, so upstream REMOVALS (e.g. cleared false positives)
+// aren't dropped locally — and the blocklist API has no removal/updated_at feed. We detect
+// removals via totalCount (after the add-pass, localTotal - upstreamTotal == pending removals),
+// pinpoint the oldest month whose count no longer matches, then re-reconcile only
+// [that month → now]: re-fetch the range, upsert (preserves published_at), and delete any
+// local row absent upstream. Common case (nothing removed) costs one count probe per ecosystem.
+async function reconcileMalwareRemovals(apiName, dbName) {
+  const upstreamTotal = await malwareTotalCountSince(apiName, MALWARE_EPOCH);
+  const localTotal = db.prepare(`SELECT COUNT(*) AS n FROM malware WHERE ecosystem = ?`).get(dbName).n;
+  if (localTotal === upstreamTotal) return; // adds already reconciled, nothing removed
+
+  console.log(`[${dbName}] reconcile: local ${localTotal} vs upstream ${upstreamTotal} — locating changed month(s)`);
+  const bounds = malwareMonthBoundaries();
+  const counts = await Promise.all(bounds.map(b => malwareTotalCountSince(apiName, b)));
+  let repairFrom = null;
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const upstreamMonth = counts[i] - counts[i + 1];
+    const localMonth = db.prepare(`SELECT COUNT(*) AS n FROM malware WHERE ecosystem = ? AND blocked_at >= ? AND blocked_at < ?`).get(dbName, bounds[i], bounds[i + 1]).n;
+    if (upstreamMonth !== localMonth) { repairFrom = bounds[i]; break; }
+  }
+  if (!repairFrom) repairFrom = MALWARE_EPOCH; // totals differ but no month pinned → full reconcile
+  console.log(`[${dbName}] reconcile: re-syncing ${repairFrom.slice(0, 10)} → now`);
+
+  const upstreamKeys = new Set();
+  await malwarePageThrough(apiName, repairFrom, (items) => {
+    for (const it of items) upstreamKeys.add(malKey(it.packageName, it.version, it.malid, it.blockedAt));
+    insertItems(items, dbName);
+  });
+  if (syncState.cancelled) return;
+
+  const localRows = db.prepare(`SELECT package_name, version, malid, blocked_at FROM malware WHERE ecosystem = ? AND blocked_at >= ?`).all(dbName, repairFrom);
+  const delStmt = db.prepare(`DELETE FROM malware WHERE ecosystem = ? AND package_name = ? AND version = ? AND malid = ? AND blocked_at = ?`);
+  let removed = 0;
+  db.transaction(() => {
+    for (const r of localRows) {
+      if (!upstreamKeys.has(malKey(r.package_name, r.version, r.malid, r.blocked_at))) {
+        delStmt.run(dbName, r.package_name, r.version, r.malid, r.blocked_at);
+        removed++;
+      }
+    }
+  })();
+  console.log(`[${dbName}] reconcile: removed ${removed} stale record(s)`);
+}
+
 async function runMalwareSync({ token, full = false }) {
   if (syncState.running) throw new Error('Sync already in progress');
   if (!token) throw new Error('No platform token available');
-  syncState.running = true;
-  syncState.fetched = 0;
-  syncState.total = 0;
-  syncState.error = null;
-  syncState.startedAt = new Date().toISOString();
-  syncState.finishedAt = null;
-  syncState.windowsDone = 0;
-  syncState.windowsTotal = 0;
-  syncState.cancelled = false;
-  const apiBase = 'https://console-api.enforce.dev/libraries/v1/malware/blocklist';
-  try {
-    for (const { apiName, dbName } of PLATFORM_ECOSYSTEMS) {
-      if (syncState.cancelled) break;
-      let savedPubDates = null;
-      if (full) {
-        savedPubDates = db.prepare(
-          `SELECT package_name, version, published_at FROM malware WHERE ecosystem = ? AND published_at IS NOT NULL`
-        ).all(dbName);
-        db.prepare(`DELETE FROM malware WHERE ecosystem = ?`).run(dbName);
-        db.prepare(`DELETE FROM sync_windows WHERE ecosystem = ?`).run(dbName);
-      }
+  Object.assign(syncState, {
+    running: true, fetched: 0, total: 0, error: null,
+    startedAt: new Date().toISOString(), finishedAt: null,
+    windowsDone: 0, windowsTotal: 0, cancelled: false,
+  });
 
-      // Build list of monthly windows from 2026-01-01 to now+1d
-      function allMonthlyWindows() {
-        const wins = [];
-        let cursor = new Date('2026-01-01T00:00:00Z');
-        const end = new Date(Date.now() + 86400000);
-        while (cursor < end) {
-          const next = new Date(cursor);
-          next.setUTCMonth(next.getUTCMonth() + 1);
-          wins.push({ since: cursor.toISOString(), until: (next > end ? end : next).toISOString() });
-          cursor = next;
-        }
-        return wins;
-      }
-
-      const markWindowDone = db.prepare(
-        `INSERT OR REPLACE INTO sync_windows (ecosystem, window_start, window_end, synced_at) VALUES (?, ?, ?, ?)`
-      );
-
-      let windows;
-      if (full) {
-        // Full resync: all monthly windows (already deleted rows above)
-        windows = allMonthlyWindows();
-      } else {
-        // Delta: backfill any past months not yet marked complete, then fetch the
-        // current month + incremental delta so nothing is missed.
-        const currentMonthStart = new Date();
-        currentMonthStart.setUTCDate(1); currentMonthStart.setUTCHours(0,0,0,0);
-        const currentMonthStartISO = currentMonthStart.toISOString();
-
-        const allWins = allMonthlyWindows();
-        const completedSet = new Set(
-          db.prepare(`SELECT window_start FROM sync_windows WHERE ecosystem = ?`).all(dbName).map(r => r.window_start)
-        );
-        // Past months not yet completed = need backfill
-        const backfill = allWins.filter(w => w.since < currentMonthStartISO && !completedSet.has(w.since));
-        // Incremental delta from MAX(blocked_at) — covers current month and any new entries
-        const latest = db.prepare(`SELECT MAX(blocked_at) AS m FROM malware WHERE ecosystem = ?`).get(dbName);
-        const deltaWin = { since: latest?.m || currentMonthStartISO, until: null };
-
-        windows = [...backfill, deltaWin];
-        if (backfill.length) console.log(`[${dbName}] backfilling ${backfill.length} missing month(s): ${backfill.map(w => w.since.slice(0,7)).join(', ')}`);
-      }
-
-      syncState.windowsTotal += windows.length;
-
-      for (const window of windows) {
-        if (syncState.cancelled) break;
-        let pageToken = null;
-        while (true) {
-          if (syncState.cancelled) break;
-          const params = new URLSearchParams({ ecosystem: apiName, pageSize: '500' });
-          params.set('since', window.since);
-          if (window.until) params.set('until', window.until);
-          if (pageToken) params.set('pageToken', pageToken);
-          let res;
-          for (let attempt = 1; ; attempt++) {
-            res = await fetch(`${apiBase}?${params}`, { headers: { Authorization: `Bearer ${platformToken}` } });
-            if (res.status === 401) {
-              console.log(`Token expired mid-sync (${apiName}), attempting chainctl refresh…`);
-              const refreshed = await refreshPlatformTokenViaChainctl();
-              if (!refreshed) throw new Error(`HTTP 401 from Platform API (${apiName}) — token expired and chainctl refresh failed`);
-              res = await fetch(`${apiBase}?${params}`, { headers: { Authorization: `Bearer ${platformToken}` } });
-            }
-            if (res.ok) break;
-
-            // Non-OK: capture body + context so recurrences are diagnosable (the body is
-            // otherwise discarded, which is why past 500s left no trace to debug).
-            const bodyText = await res.text().catch(() => '<unreadable body>');
-            const reqId = res.headers.get('x-request-id') || res.headers.get('x-amzn-requestid') || res.headers.get('cf-ray') || null;
-            const ctx = `ecosystem=${apiName} since=${window.since} until=${window.until ?? '(open)'} page=${pageToken ? pageToken.slice(0, 16) + '…' : '1'}`;
-            console.error(
-              `[malware-sync] HTTP ${res.status} from Platform API — ${ctx}${reqId ? ` reqId=${reqId}` : ''}\n` +
-              `  url:  ${apiBase}?${params}\n` +
-              `  body: ${bodyText.slice(0, 1000)}`
-            );
-
-            // Transient 5xx / 429 → back off and retry a few times before failing the whole sync.
-            if ((res.status >= 500 || res.status === 429) && attempt <= 3) {
-              const backoff = 1000 * attempt;
-              console.warn(`[malware-sync] transient ${res.status}, retrying in ${backoff}ms (attempt ${attempt}/3)…`);
-              await new Promise(r => setTimeout(r, backoff));
-              continue;
-            }
-
-            let msg = `HTTP ${res.status} from Platform API (${apiName})`;
-            if (res.status === 401) {
-              const ts = platformTokenExpiry ? new Date(platformTokenExpiry).toISOString() : 'unknown';
-              msg += ` — token rejected after refresh attempt (expires ${ts})`;
-            }
-            if (bodyText && bodyText !== '<unreadable body>') msg += `: ${bodyText.slice(0, 300)}`;
-            throw new Error(msg);
-          }
-          const data = await res.json();
-          const items = data.items || [];
-          insertItems(items, dbName);
-          if (!data.nextPageToken || items.length === 0) break;
-          pageToken = data.nextPageToken;
-        }
-        // Mark past windows complete (not the open-ended delta or current month)
-        if (window.until) {
-          const windowEnd = new Date(window.until);
-          const now = new Date();
-          if (windowEnd <= now) {
-            markWindowDone.run(dbName, window.since, window.until, new Date().toISOString());
-          }
-        }
-        syncState.windowsDone++;
-      }
-
-      if (full && savedPubDates?.length) {
-        const restoreStmt = db.prepare(
-          `UPDATE malware SET published_at = ? WHERE ecosystem = ? AND package_name = ? AND version = ?`
-        );
-        db.transaction(() => {
-          for (const row of savedPubDates) restoreStmt.run(row.published_at, dbName, row.package_name, row.version);
-        })();
-      }
+  async function syncOneEcosystem({ apiName, dbName }) {
+    if (syncState.cancelled) return;
+    let savedPubDates = null;
+    if (full) {
+      savedPubDates = db.prepare(`SELECT package_name, version, published_at FROM malware WHERE ecosystem = ? AND published_at IS NOT NULL`).all(dbName);
+      db.prepare(`DELETE FROM malware WHERE ecosystem = ?`).run(dbName);
     }
+
+    // Add-pass: first sync (or full) pulls everything since the epoch; later syncs pull
+    // only entries newer than our latest known blocked_at. (API is newest-first, `since`
+    // inclusive, `until` ignored.)
+    const latest = full ? null : db.prepare(`SELECT MAX(blocked_at) AS m FROM malware WHERE ecosystem = ?`).get(dbName)?.m;
+    syncState.windowsTotal += 1;
+    await malwarePageThrough(apiName, latest || MALWARE_EPOCH, (items) => insertItems(items, dbName));
+    syncState.windowsDone += 1;
+
+    // Reconcile removals (skipped implicitly on `full` since the add-pass already rebuilt the set).
+    if (!syncState.cancelled) await reconcileMalwareRemovals(apiName, dbName);
+
+    if (full && savedPubDates?.length) {
+      const restoreStmt = db.prepare(`UPDATE malware SET published_at = ? WHERE ecosystem = ? AND package_name = ? AND version = ?`);
+      db.transaction(() => { for (const row of savedPubDates) restoreStmt.run(row.published_at, dbName, row.package_name, row.version); })();
+    }
+  }
+
+  try {
+    // Ecosystems run concurrently (npm ~351k dominates; Maven/PyPI finish far sooner).
+    const results = await Promise.allSettled(PLATFORM_ECOSYSTEMS.map(syncOneEcosystem));
+    const failed = results.find(r => r.status === 'rejected');
+    if (failed) throw failed.reason;
     db.prepare(`INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_sync_at', ?)`).run(new Date().toISOString());
   } catch (err) {
     syncState.error = err.message;
