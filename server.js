@@ -185,6 +185,15 @@ const PLATFORM_ECOSYSTEMS = [
   { apiName: 'PyPI',  dbName: 'PyPI'  },
 ];
 
+// One-time cleanup: earlier syncs stored rows under the API's inconsistent ecosystem
+// casing (e.g. 'pypi'/'maven'), producing orphan rows the read path never queries.
+// Drop anything outside the canonical set (derived here so it can't wipe a real ecosystem).
+{
+  const canonical = PLATFORM_ECOSYSTEMS.map(e => e.dbName);
+  const res = db.prepare(`DELETE FROM malware WHERE ecosystem NOT IN (${canonical.map(() => '?').join(',')})`).run(...canonical);
+  if (res.changes) console.log(`[migration] removed ${res.changes} orphan malware row(s) with non-canonical ecosystem casing`);
+}
+
 let platformToken = process.env.PLATFORM_API_TOKEN || null;
 let platformTokenExpiry = null; // Unix timestamp (ms)
 let tokenRefreshTimer = null;
@@ -228,22 +237,41 @@ function setPlatformToken(token) {
   if (platformTokenExpiry) scheduleTokenRefresh();
 }
 
-async function refreshPlatformTokenViaChainctl() {
-  try {
-    const proc = Bun.spawn(['chainctl', 'auth', 'token', '--audience', 'https://console-api.enforce.dev'], {
-      stdout: 'pipe', stderr: 'pipe',
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code !== 0) throw new Error(`chainctl exited ${code}`);
-    const token = text.trim();
-    if (!token) throw new Error('empty token');
-    setPlatformToken(token);
-    console.log('Platform token refreshed via chainctl, expires', new Date(platformTokenExpiry).toISOString());
-    return token;
-  } catch (err) {
-    console.error('chainctl token refresh failed:', err.message);
-    return null;
+let tokenRefreshInFlight = null;
+// Single-flight: concurrent callers (e.g. parallel ecosystem syncs all hitting 401
+// at once) share one chainctl mint instead of spawning several.
+function refreshPlatformTokenViaChainctl() {
+  if (tokenRefreshInFlight) return tokenRefreshInFlight;
+  tokenRefreshInFlight = (async () => {
+    try {
+      const proc = Bun.spawn(['chainctl', 'auth', 'token', '--audience', 'https://console-api.enforce.dev'], {
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      const text = await new Response(proc.stdout).text();
+      const code = await proc.exited;
+      if (code !== 0) throw new Error(`chainctl exited ${code}`);
+      const token = text.trim();
+      if (!token) throw new Error('empty token');
+      setPlatformToken(token);
+      console.log('Platform token refreshed via chainctl, expires', new Date(platformTokenExpiry).toISOString());
+      return token;
+    } catch (err) {
+      console.error('chainctl token refresh failed:', err.message);
+      return null;
+    }
+  })();
+  tokenRefreshInFlight.finally(() => { tokenRefreshInFlight = null; });
+  return tokenRefreshInFlight;
+}
+
+// Proactively refresh if the token is missing or within `minMs` of expiry — called
+// before a sync so a long page-through doesn't hit a mid-flight 401 (which can
+// truncate pagination). Never throws; best-effort.
+async function ensurePlatformTokenFresh(minMs = 10 * 60 * 1000) {
+  const needsRefresh = !platformToken || (platformTokenExpiry && platformTokenExpiry - Date.now() < minMs);
+  if (needsRefresh) {
+    console.log('[malware-sync] platform token missing or near expiry — refreshing before sync');
+    await refreshPlatformTokenViaChainctl();
   }
 }
 
@@ -304,7 +332,8 @@ function insertItems(items, ecoName) {
         it.malid ?? '',
         it.source ?? null,
         it.blocked_at ?? it.blockedAt,
-        it.ecosystem || ecoName,
+        ecoName, // always the queried ecosystem — the API returns inconsistent casing
+                 // (e.g. 'pypi' vs 'PyPI') in the item field, which the read path never matches
         JSON.stringify(it.reason || []),
         it.description ?? null,
       );
@@ -379,33 +408,49 @@ function malwareMonthBoundaries() {
 
 // The delta add-pass only inserts, so upstream REMOVALS (e.g. cleared false positives)
 // aren't dropped locally — and the blocklist API has no removal/updated_at feed. We detect
-// removals via totalCount (after the add-pass, localTotal - upstreamTotal == pending removals),
-// pinpoint the oldest month whose count no longer matches, then re-reconcile only
-// [that month → now]: re-fetch the range, upsert (preserves published_at), and delete any
-// local row absent upstream. Common case (nothing removed) costs one count probe per ecosystem.
+// them by comparing counts within a recent HORIZON window only (removals are recent):
+//   - Windowing (not global totals) avoids re-triggering forever on ancient drift and on
+//     totalCount noise, which fluctuates ±tens on the live ~351k npm feed.
+//   - A small margin absorbs that noise + the add-pass racing the live feed, so only a
+//     genuine removal batch (local exceeding upstream in-window beyond the noise) reconciles.
+// When it does fire, it re-fetches [horizon → now], upserts (preserves published_at), and
+// deletes any local row in-window absent upstream. Older drift is a job for a full resync.
 async function reconcileMalwareRemovals(apiName, dbName) {
-  const upstreamTotal = await malwareTotalCountSince(apiName, MALWARE_EPOCH);
-  const localTotal = db.prepare(`SELECT COUNT(*) AS n FROM malware WHERE ecosystem = ?`).get(dbName).n;
-  if (localTotal === upstreamTotal) return; // adds already reconciled, nothing removed
+  const HORIZON_DAYS = 21;
+  const horizon = new Date(Date.now() - HORIZON_DAYS * 86400000).toISOString();
+  const upstreamRecent = await malwareTotalCountSince(apiName, horizon);
+  const localRecent = db.prepare(`SELECT COUNT(*) AS n FROM malware WHERE ecosystem = ? AND blocked_at >= ?`).get(dbName, horizon).n;
+  const margin = Math.max(25, Math.round(upstreamRecent * 0.001));
+  // local exceeding upstream in-window beyond the noise margin ⇒ real removals to reconcile.
+  // Otherwise it's just new adds / count jitter → nothing to do (add-pass handles adds).
+  if (localRecent <= upstreamRecent + margin) return;
 
-  console.log(`[${dbName}] reconcile: local ${localTotal} vs upstream ${upstreamTotal} — locating changed month(s)`);
-  const bounds = malwareMonthBoundaries();
-  const counts = await Promise.all(bounds.map(b => malwareTotalCountSince(apiName, b)));
-  let repairFrom = null;
-  for (let i = 0; i < bounds.length - 1; i++) {
-    const upstreamMonth = counts[i] - counts[i + 1];
-    const localMonth = db.prepare(`SELECT COUNT(*) AS n FROM malware WHERE ecosystem = ? AND blocked_at >= ? AND blocked_at < ?`).get(dbName, bounds[i], bounds[i + 1]).n;
-    if (upstreamMonth !== localMonth) { repairFrom = bounds[i]; break; }
+  const repairFrom = horizon;
+  const expected = upstreamRecent;
+  console.log(`[${dbName}] reconcile: recent-window local ${localRecent} > upstream ${upstreamRecent} (+${margin} margin) — re-syncing ${repairFrom.slice(0, 10)} → now`);
+
+  // Fetch the repair range. CRITICAL: only proceed to the delete step if the page-through
+  // was COMPLETE — an incomplete fetch (e.g. truncated by a mid-flight token refresh) would
+  // make us delete rows that actually exist upstream. Verify fetched vs expected; retry on short.
+  const tolerance = Math.max(20, Math.round(expected * 0.01));
+  let upstreamKeys = null;
+  for (let attempt = 1; attempt <= 3 && !syncState.cancelled; attempt++) {
+    await ensurePlatformTokenFresh(); // avoid a mid-page-through 401 on long ranges
+    const keys = new Set();
+    await malwarePageThrough(apiName, repairFrom, (items) => {
+      for (const it of items) keys.add(malKey(it.packageName, it.version, it.malid, it.blockedAt));
+      insertItems(items, dbName);
+    });
+    if (syncState.cancelled) return;
+    console.log(`[${dbName}] reconcile: fetched ${keys.size} unique keys (expected ~${expected}, gate ${expected - tolerance}) attempt ${attempt}`);
+    if (keys.size >= expected - tolerance) { upstreamKeys = keys; break; }
+    console.warn(`[${dbName}] reconcile: fetched ${keys.size} < expected ${expected} (attempt ${attempt}/3) — retrying before delete`);
   }
-  if (!repairFrom) repairFrom = MALWARE_EPOCH; // totals differ but no month pinned → full reconcile
-  console.log(`[${dbName}] reconcile: re-syncing ${repairFrom.slice(0, 10)} → now`);
-
-  const upstreamKeys = new Set();
-  await malwarePageThrough(apiName, repairFrom, (items) => {
-    for (const it of items) upstreamKeys.add(malKey(it.packageName, it.version, it.malid, it.blockedAt));
-    insertItems(items, dbName);
-  });
-  if (syncState.cancelled) return;
+  if (!upstreamKeys) {
+    // Never delete against an incomplete set — leave the (already-upserted) adds and bail.
+    console.error(`[${dbName}] reconcile: fetch stayed short after retries — skipping delete to avoid over-removal; will retry next sync`);
+    return;
+  }
 
   const localRows = db.prepare(`SELECT package_name, version, malid, blocked_at FROM malware WHERE ecosystem = ? AND blocked_at >= ?`).all(dbName, repairFrom);
   const delStmt = db.prepare(`DELETE FROM malware WHERE ecosystem = ? AND package_name = ? AND version = ? AND malid = ? AND blocked_at = ?`);
@@ -429,6 +474,7 @@ async function runMalwareSync({ token, full = false }) {
     startedAt: new Date().toISOString(), finishedAt: null,
     windowsDone: 0, windowsTotal: 0, cancelled: false,
   });
+  await ensurePlatformTokenFresh(); // avoid a mid-sync 401 truncating a page-through
 
   async function syncOneEcosystem({ apiName, dbName }) {
     if (syncState.cancelled) return;
@@ -456,10 +502,12 @@ async function runMalwareSync({ token, full = false }) {
   }
 
   try {
-    // Ecosystems run concurrently (npm ~351k dominates; Maven/PyPI finish far sooner).
-    const results = await Promise.allSettled(PLATFORM_ECOSYSTEMS.map(syncOneEcosystem));
-    const failed = results.find(r => r.status === 'rejected');
-    if (failed) throw failed.reason;
+    // Ecosystems run sequentially — the blocklist API's pagination cursors proved
+    // unreliable when several page-throughs ran concurrently (crossed/short reads).
+    for (const eco of PLATFORM_ECOSYSTEMS) {
+      if (syncState.cancelled) break;
+      await syncOneEcosystem(eco);
+    }
     db.prepare(`INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_sync_at', ?)`).run(new Date().toISOString());
   } catch (err) {
     syncState.error = err.message;

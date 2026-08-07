@@ -1072,7 +1072,9 @@
     <div style="margin-top:0.5rem;">
       <div class="mal-bar" style="margin-bottom:0.5rem;">
         <input type="text" id="lag-table-search" placeholder="Search package name…" style="min-width:220px; flex:1;">
-        <input type="text" id="lag-table-version" placeholder="Version…" style="min-width:100px; width:120px;">
+        <label style="display:flex; align-items:center; gap:0.3rem; font-size:0.8rem; color:#475569; white-space:nowrap; cursor:pointer;" title="Match the package name exactly instead of a substring search">
+          <input type="checkbox" id="lag-table-exact"> exact
+        </label>
         <span style="flex:1"></span>
         <span><span class="mal-stat" id="lag-table-count">0</span> packages</span>
         <button type="button" class="copy-btn" id="lag-table-prev" disabled>← Prev</button>
@@ -1581,9 +1583,9 @@ tabBtns.forEach(btn => {
 // ── State ─────────────────────────────────────────────────────────────────────
 
 const state = {
-  npm:   { lastData: null, lastSnapshot: null, sort: { key: 'version', dir: -1 } },
-  maven: { lastData: null, lastSnapshot: null, sort: { key: 'version', dir: -1 }, statFilter: null },
-  pypi:  { lastData: null, lastSnapshot: null, sort: { key: 'version', dir: -1 } },
+  npm:   { lastData: null, lastSnapshot: null, sort: { key: 'published', dir: -1 } },
+  maven: { lastData: null, lastSnapshot: null, sort: { key: 'published', dir: -1 }, statFilter: null },
+  pypi:  { lastData: null, lastSnapshot: null, sort: { key: 'published', dir: -1 } },
   bulk:  { lastData: null,                     sort: { key: 'pkg',     dir:  1 } },
   scan:  { packages: null },
 };
@@ -4244,9 +4246,8 @@ let _lagTableTimer = null;
 async function lagLoadTable() {
   const p = lagBuildStatsParams();
   const q = document.getElementById("lag-table-search").value.trim();
-  const ver = document.getElementById("lag-table-version").value.trim();
   if (q) p.set("q", q);
-  if (ver) p.set("version", ver);
+  if (document.getElementById("lag-table-exact").checked) p.set("exact", "1");
   p.set('limit', lagTableState.pageSize);
   p.set('offset', lagTableState.page * lagTableState.pageSize);
 
@@ -4297,26 +4298,31 @@ function lagScheduleTable(immediate = false) {
 }
 
 document.getElementById('lag-table-search').addEventListener('input', () => lagScheduleTable());
-document.getElementById('lag-table-version').addEventListener('input', () => lagScheduleTable());
+document.getElementById('lag-table-exact').addEventListener('change', () => lagScheduleTable(true));
 document.getElementById('lag-table-prev').addEventListener('click', () => { if (lagTableState.page > 0) { lagTableState.page--; lagLoadTable(); } });
 document.getElementById('lag-table-next').addEventListener('click', () => { lagTableState.page++; lagLoadTable(); });
 
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
 {
-  const box = document.getElementById('tip-box');
+  // #tip-box is declared after this script, so look it up lazily and guard for null.
+  const getBox = () => document.getElementById('tip-box');
   document.addEventListener('mouseover', e => {
     const el = e.target.closest('.tip');
     if (!el) return;
+    const box = getBox();
+    if (!box) return;
     box.textContent = el.dataset.tip || '';
     box.style.display = 'block';
   });
   document.addEventListener('mouseout', e => {
     if (!e.target.closest('.tip')) return;
-    box.style.display = 'none';
+    const box = getBox();
+    if (box) box.style.display = 'none';
   });
   document.addEventListener('mousemove', e => {
-    if (box.style.display === 'none') return;
+    const box = getBox();
+    if (!box || box.style.display === 'none') return;
     const x = e.clientX + 12, y = e.clientY + 12;
     const vw = window.innerWidth, vh = window.innerHeight;
     box.style.left = (x + 260 > vw ? vw - 268 : x) + 'px';
