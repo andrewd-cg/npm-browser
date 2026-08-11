@@ -466,6 +466,66 @@ async function reconcileMalwareRemovals(apiName, dbName) {
   console.log(`[${dbName}] reconcile: removed ${removed} stale record(s)`);
 }
 
+// Lazy per-package reconcile. The blocklist API has no removal feed, so a lone
+// cleared entry (below the batch-reconcile noise margin) can linger locally until
+// a full resync. But the API filters by packageName, so we can cheaply verify one
+// package on demand: fetch its upstream entries, upsert them (ON CONFLICT preserves
+// published_at), and drop any local row for that package no longer upstream. This
+// self-heals the interactive "I'm looking at package X" case without a full sync.
+// Best-effort: throws on API failure so the caller can fall back to local rows.
+// A short per-(eco,pkg) TTL avoids hammering the API on repeat views.
+const PKG_RECONCILE_TTL = 5 * 60 * 1000;
+const pkgReconciledAt = new Map(); // `${ecoDbName} ${pkg}` → last-reconciled epoch ms
+
+async function reconcilePackage(ecoDbName, apiName, pkg) {
+  // Skip when unauthenticated (avoid a chainctl mint storm on the read path) or
+  // mid-sync (the running sync is already rewriting this ecosystem).
+  if (!platformToken || !pkg || syncState.running) return;
+  const cacheKey = `${ecoDbName} ${pkg}`;
+  const last = pkgReconciledAt.get(cacheKey);
+  if (last && Date.now() - last < PKG_RECONCILE_TTL) return;
+
+  // Fetch every upstream entry for this package (paginated — single packages are
+  // usually one page, but long histories can exceed pageSize).
+  const items = [];
+  const upstreamKeys = new Set();
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({ ecosystem: apiName, packageName: pkg, pageSize: '500' });
+    if (pageToken) params.set('pageToken', pageToken);
+    const data = await malwareApiGet(params, `pkg-check ${apiName} ${pkg}`);
+    for (const it of (data.items || [])) {
+      items.push(it);
+      upstreamKeys.add(malKey(it.packageName, it.version, it.malid, it.blockedAt));
+    }
+    pageToken = data.nextPageToken || null;
+  } while (pageToken);
+
+  // Reached only if the full page-through succeeded (malwareApiGet throws otherwise),
+  // so upstreamKeys is complete and safe to delete against.
+  const localRows = db.prepare(`SELECT version, malid, blocked_at FROM malware WHERE ecosystem = ? AND package_name = ?`).all(ecoDbName, pkg);
+  const delStmt = db.prepare(`DELETE FROM malware WHERE ecosystem = ? AND package_name = ? AND version = ? AND malid = ? AND blocked_at = ?`);
+  let inserted = 0, removed = 0;
+  db.transaction(() => {
+    for (const it of items) {
+      const res = insertMalware.run(
+        it.packageName, it.version ?? '', normScope(it.scope), it.malid ?? '',
+        it.source ?? null, it.blockedAt, ecoDbName,
+        JSON.stringify(it.reason || []), it.description ?? null,
+      );
+      if (res.changes) inserted++;
+    }
+    for (const r of localRows) {
+      if (!upstreamKeys.has(malKey(pkg, r.version, r.malid, r.blocked_at))) {
+        delStmt.run(ecoDbName, pkg, r.version, r.malid, r.blocked_at);
+        removed++;
+      }
+    }
+  })();
+  pkgReconciledAt.set(cacheKey, Date.now());
+  if (removed || inserted) console.log(`[pkg-check] reconciled ${ecoDbName} ${pkg}: +${inserted} upserted, -${removed} stale`);
+}
+
 async function runMalwareSync({ token, full = false }) {
   if (syncState.running) throw new Error('Sync already in progress');
   if (!token) throw new Error('No platform token available');
@@ -1072,10 +1132,18 @@ Bun.serve({
     // All malware entries for one package (any version, any source).
     // Used by the npm tab to badge versions/packages flagged as malware.
     if (url.pathname === '/api/cgr-malware/check') {
-      const pkg = url.searchParams.get('package') || '';
+      const rawPkg = url.searchParams.get('package') || '';
       const ecoParam = url.searchParams.get('eco') || 'npm';
       const ecoDbName = ecoParam === 'maven' ? 'Maven' : ecoParam === 'pypi' ? 'PyPI' : 'npm';
+      // Maven coordinates are `group:artifact` upstream and in-DB, but the UI passes
+      // `group/artifact` — normalise so both the lookup and reconcile match.
+      const pkg = ecoDbName === 'Maven' ? rawPkg.replace('/', ':') : rawPkg;
       if (!pkg) return new Response(JSON.stringify({ rows: [] }), { headers: { 'Content-Type': 'application/json' } });
+      // Self-heal against the live API (apiName === dbName for all three ecosystems)
+      // so cleared/added entries reconcile without waiting for a full sync. Best-effort:
+      // on any API failure, fall through to whatever we have locally.
+      try { await reconcilePackage(ecoDbName, ecoDbName, pkg); }
+      catch (err) { console.warn(`[pkg-check] reconcile failed for ${ecoDbName} ${pkg}: ${err.message}`); }
       const rows = db.prepare(`
         SELECT package_name, version, scope, malid, source, blocked_at, reason_json, description
         FROM malware
@@ -1093,8 +1161,11 @@ Bun.serve({
       const body = await req.json().catch(() => ({}));
       const ecoParam = body.ecosystem || 'npm';
       const ecoDbName = ecoParam === 'maven' ? 'Maven' : ecoParam === 'pypi' ? 'PyPI' : 'npm';
+      // Maven coordinates are `group:artifact` (colon) upstream and in-DB; callers
+      // may pass `group/artifact` (slash) — normalise so the IN() query matches.
+      const normName = n => (ecoDbName === 'Maven' ? n.replace('/', ':') : n);
       const names = Array.isArray(body.packages)
-        ? [...new Set(body.packages.filter(n => typeof n === 'string' && n))]
+        ? [...new Set(body.packages.filter(n => typeof n === 'string' && n).map(normName))]
         : [];
       const SENTINELS = new Set(['NOT_FOUND', 'ERROR']);
       const results = {};

@@ -457,6 +457,16 @@
   }
   .copy-btn:hover { background: #e2e8f0; color: #1a1a2e; border-color: #94a3b8; }
   .copy-btn.copied { background: #f0fdf4; color: #16a34a; border-color: #86efac; }
+  .results-title .title-row { display: flex; align-items: baseline; gap: 0.6rem; }
+  .malware-curl-btn {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px;
+    padding: 3px 10px; font: inherit; font-size: 0.75rem; font-weight: 500;
+    color: #b91c1c; cursor: pointer; white-space: nowrap;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .malware-curl-btn:hover { background: #fee2e2; border-color: #f87171; }
+  .malware-curl-btn.copied { background: #f0fdf4; color: #16a34a; border-color: #86efac; }
 
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
@@ -1195,6 +1205,29 @@ function copyToClipboard(text, btn) {
   }
 }
 
+// Malware blocklist API "copy curl" helpers. The blocklist API filters by
+// packageName (server-side) but ignores `version`, so the generated command
+// returns every flagged version for the package. Maven package names use the
+// `group:artifact` form upstream (npm/pypi are the bare name).
+function malwareApiEcoName(eco) { return eco === 'maven' ? 'Maven' : eco === 'pypi' ? 'PyPI' : 'npm'; }
+
+function buildMalwareCurl(eco, pkg) {
+  const apiName = malwareApiEcoName(eco);
+  // Embed the live platform token if we have one (copy-paste-run works anywhere);
+  // otherwise fall back to minting it inline via chainctl at run time.
+  const token = getPlatformToken() || '$(chainctl auth token --audience https://console-api.enforce.dev)';
+  const q = new URLSearchParams({ ecosystem: apiName, packageName: pkg, pageSize: '500' });
+  return `curl -s 'https://console-api.enforce.dev/libraries/v1/malware/blocklist?${q}' -H 'Authorization: Bearer ${token}'`;
+}
+
+function copyMalwareCurl(btn) {
+  copyToClipboard(buildMalwareCurl(btn.dataset.eco, btn.dataset.pkg), btn);
+}
+
+function malwareCurlBtn(eco, pkg) {
+  return `<button class="malware-curl-btn" data-eco="${escHtml(eco)}" data-pkg="${escHtml(pkg)}" onclick="copyMalwareCurl(this)" data-tip="Copies a curl command (with your platform token embedded) that queries the Chainguard malware blocklist API for every flagged version of this package">Copy curl to check Malware API</button>`;
+}
+
 // Shared fast hover tooltip. Any element with `data-tip` attribute gets a
 // dark floating tooltip after ~50ms (vs the browser's native ~1s `title` delay).
 let _appTooltipEl = null;
@@ -1797,9 +1830,12 @@ function npmRenderTable(data) {
 
   let html = `
     <div class="results-header">
-      <div class="results-title">
-        <a class="pkg-name" href="https://www.npmjs.com/package/${encodeURIComponent(name)}?activeTab=versions" target="_blank" rel="noopener">${escHtml(name)}</a>
-        <span class="count">${escHtml(countNote)}</span>
+      <div class="results-title stacked">
+        <div class="title-row">
+          <a class="pkg-name" href="https://www.npmjs.com/package/${encodeURIComponent(name)}?activeTab=versions" target="_blank" rel="noopener">${escHtml(name)}</a>
+          <span class="count">${escHtml(countNote)}</span>
+        </div>
+        ${malwareCurlBtn('npm', name)}
       </div>
       <div class="header-right">
         ${statsH}
@@ -2187,6 +2223,7 @@ function mavenRenderTable(data) {
       <div class="results-title stacked">
         <a class="pkg-name mono" href="${escHtml(mvnSearchUrl)}" target="_blank" rel="noopener">${escHtml(name)}</a>
         <span class="count">${escHtml(countNote)}${sf ? ` · <button class="filter-chip" data-clear-stat title="Clear filter">${escHtml(MAVEN_STAT_LABELS[sf])} ✕</button>` : ''}${data.datesLoading ? ' · <span style="opacity:.65">loading publish dates…</span>' : ''}</span>
+        ${malwareCurlBtn('maven', `${group}:${artifact}`)}
       </div>
       <div class="header-right">
         ${statsH}
@@ -2700,9 +2737,12 @@ function pypiRenderTable(data) {
 
   let html = `
     <div class="results-header">
-      <div class="results-title">
-        <a class="pkg-name" href="${escHtml(pypiPkgUrl)}" target="_blank" rel="noopener">${escHtml(name)}</a>
-        <span class="count">${escHtml(countNote)}</span>
+      <div class="results-title stacked">
+        <div class="title-row">
+          <a class="pkg-name" href="${escHtml(pypiPkgUrl)}" target="_blank" rel="noopener">${escHtml(name)}</a>
+          <span class="count">${escHtml(countNote)}</span>
+        </div>
+        ${malwareCurlBtn('pypi', name)}
       </div>
       <div class="header-right">
         ${statsH}
