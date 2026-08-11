@@ -1213,11 +1213,10 @@ function malwareApiEcoName(eco) { return eco === 'maven' ? 'Maven' : eco === 'py
 
 function buildMalwareCurl(eco, pkg) {
   const apiName = malwareApiEcoName(eco);
-  // Embed the live platform token if we have one (copy-paste-run works anywhere);
-  // otherwise fall back to minting it inline via chainctl at run time.
-  const token = getPlatformToken() || '$(chainctl auth token --audience https://console-api.enforce.dev)';
+  // Mint the token inline via chainctl at run time (double-quoted header so the
+  // shell expands the $(…)) rather than baking in a token that would expire.
   const q = new URLSearchParams({ ecosystem: apiName, packageName: pkg, pageSize: '500' });
-  return `curl -s 'https://console-api.enforce.dev/libraries/v1/malware/blocklist?${q}' -H 'Authorization: Bearer ${token}'`;
+  return `curl -s 'https://console-api.enforce.dev/libraries/v1/malware/blocklist?${q}' -H "Authorization: Bearer $(chainctl auth token --audience https://console-api.enforce.dev)"`;
 }
 
 function copyMalwareCurl(btn) {
@@ -1225,7 +1224,7 @@ function copyMalwareCurl(btn) {
 }
 
 function malwareCurlBtn(eco, pkg) {
-  return `<button class="malware-curl-btn" data-eco="${escHtml(eco)}" data-pkg="${escHtml(pkg)}" onclick="copyMalwareCurl(this)" data-tip="Copies a curl command (with your platform token embedded) that queries the Chainguard malware blocklist API for every flagged version of this package">Copy curl to check Malware API</button>`;
+  return `<button class="malware-curl-btn" data-eco="${escHtml(eco)}" data-pkg="${escHtml(pkg)}" onclick="copyMalwareCurl(this)" data-tip="Copies a curl command (mints a token inline via chainctl auth token) that queries the Chainguard malware blocklist API for every flagged version of this package">Copy curl to check Malware API</button>`;
 }
 
 // Shared fast hover tooltip. Any element with `data-tip` attribute gets a
