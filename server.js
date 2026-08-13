@@ -312,9 +312,9 @@ function refreshRegistryTokenViaChainctl() {
   registryRefreshInFlight = (async () => {
     try {
       const proc = Bun.spawn(['chainctl', 'auth', 'token', '--audience', REGISTRY_AUDIENCE], { stdout: 'pipe', stderr: 'pipe' });
-      const text = await new Response(proc.stdout).text();
+      const [text, errText] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
       const code = await proc.exited;
-      if (code !== 0) throw new Error(`chainctl exited ${code}`);
+      if (code !== 0) throw new Error(`chainctl exited ${code}: ${errText.trim().slice(0, 300) || '(no stderr)'}`);
       const token = text.trim();
       if (!token) throw new Error('empty token');
       registryToken = token;
