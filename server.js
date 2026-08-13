@@ -298,7 +298,12 @@ if (platformToken) {
 
 // ── Malware sync ──────────────────────────────────────────────────────────────
 
-const syncState = { running: false, fetched: 0, total: 0, error: null, startedAt: null, finishedAt: null, windowsDone: 0, windowsTotal: 0, cancelled: false };
+const syncState = { running: false, fetched: 0, total: 0, error: null, startedAt: null, finishedAt: null, windowsDone: 0, windowsTotal: 0, cancelled: false, expectedTotal: 0 };
+
+// "Warm" once the local mirror holds a usable dataset — either persisted from a
+// previous run or filled by a completed sync. While cold (first fill in progress),
+// per-package checks are served live so the tool is useful immediately.
+let malwareWarm = db.prepare(`SELECT COUNT(*) AS n FROM malware`).get().n > 0;
 
 function malwareStatus() {
   const counts = db.prepare(`SELECT ecosystem, COUNT(*) AS n, MAX(blocked_at) AS latest FROM malware GROUP BY ecosystem`).all();
@@ -412,6 +417,52 @@ async function librariesPolicyData() {
   }
   return result;
 }
+
+// Parse a Package URL (purl) -> { type, name, version }; handles percent-encoded
+// scoped npm names and maven namespace/name joined with '/'.
+function parsePurl(purl) {
+  const m = /^pkg:([^/]+)\/(.+)$/.exec(purl || '');
+  if (!m) return null;
+  const rest = m[2].split('?')[0];
+  const at = rest.lastIndexOf('@');
+  if (at < 0) return null;
+  return { type: m[1], name: decodeURIComponent(rest.slice(0, at)), version: decodeURIComponent(rest.slice(at + 1)) };
+}
+// Canonicalise a package name so maven's group:artifact and purl's group/artifact compare equal.
+const canonName = n => (n || '').replace(/[:/]+/g, '/');
+
+// Authoritative per-version unblock times from the org's own blocked-pull events
+// (cooldown reason only). Sparse - only versions the org actually pulled. 60s memo.
+const AUTH_COOLDOWN_TTL = 60 * 1000;
+const POLICY_ENUM = { npm: 'JAVASCRIPT', pypi: 'PYTHON', maven: 'JAVA' };
+const authCooldownCache = new Map(); // `${eco} ${pkg}` -> { at, map }
+async function authoritativeCooldown(eco, pkg) {
+  if (!LIBRARIES_ORG || !platformToken || !pkg) return {};
+  const cacheKey = `${eco} ${pkg}`;
+  const hit = authCooldownCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < AUTH_COOLDOWN_TTL) return hit.map;
+  const map = {};
+  try {
+    const parent = await resolveLibrariesParent();
+    if (!parent) return map;
+    const filterName = eco === 'maven' ? pkg.split(':').pop() : pkg; // purl name = artifactId for maven
+    const data = await consoleApiGet('/libraries/v1/blocked-packages',
+      new URLSearchParams({ parent_id: parent, package_name: filterName, page_size: '1000' }), `blocked ${eco} ${pkg}`);
+    const want = canonName(pkg);
+    for (const it of (data.items || [])) {
+      if (it.reason !== 'cooldown' || !it.unblocksAt) continue;
+      if (POLICY_ENUM[eco] && it.ecosystem && it.ecosystem !== POLICY_ENUM[eco]) continue;
+      const p = parsePurl(it.purl);
+      if (!p || canonName(p.name) !== want) continue;
+      map[p.version] = it.unblocksAt;
+    }
+    authCooldownCache.set(cacheKey, { at: Date.now(), map });
+  } catch (err) {
+    console.error(`[cooldown] blocked-packages fetch failed for ${eco} ${pkg}: ${err.message}`);
+  }
+  return map;
+}
+
 // Identity key matching the malware PRIMARY KEY (normalised the same way insertItems stores).
 const malKey = (pkg, ver, malid, blockedAt) => `${pkg} ${ver ?? ''} ${malid ?? ''} ${blockedAt}`;
 
@@ -544,6 +595,40 @@ async function reconcileMalwareRemovals(apiName, dbName) {
 const PKG_RECONCILE_TTL = 5 * 60 * 1000;
 const pkgReconciledAt = new Map(); // `${ecoDbName} ${pkg}` → last-reconciled epoch ms
 
+// Fetch every upstream blocklist entry for one package (paginated).
+async function fetchPackageBlocklist(apiName, pkg) {
+  const items = [];
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({ ecosystem: apiName, packageName: pkg, pageSize: '500' });
+    if (pageToken) params.set('pageToken', pageToken);
+    const data = await malwareApiGet(params, `pkg-check ${apiName} ${pkg}`);
+    for (const it of (data.items || [])) items.push(it);
+    pageToken = data.nextPageToken || null;
+  } while (pageToken);
+  return items;
+}
+
+// Live, read-only per-package lookup used while the mirror is cold (first fill in
+// progress) so the UI shows correct results immediately instead of sparse local
+// data. Returns rows in the same shape as the DB read path. 60s memo.
+const LIVE_LOOKUP_TTL = 60 * 1000;
+const liveLookupCache = new Map(); // `${dbName} ${pkg}` -> { at, rows }
+async function liveMalwareLookup(dbName, apiName, pkg) {
+  if (!platformToken || !pkg) return null;
+  const key = `${dbName} ${pkg}`;
+  const hit = liveLookupCache.get(key);
+  if (hit && Date.now() - hit.at < LIVE_LOOKUP_TTL) return hit.rows;
+  const items = await fetchPackageBlocklist(apiName, pkg);
+  const rows = items.map(it => ({
+    package_name: it.packageName, version: it.version ?? '', scope: normScope(it.scope),
+    malid: it.malid ?? '', source: it.source ?? null, blocked_at: it.blockedAt,
+    reason: it.reason || [], description: it.description ?? null,
+  }));
+  liveLookupCache.set(key, { at: Date.now(), rows });
+  return rows;
+}
+
 async function reconcilePackage(ecoDbName, apiName, pkg) {
   // Skip when unauthenticated (avoid a chainctl mint storm on the read path) or
   // mid-sync (the running sync is already rewriting this ecosystem).
@@ -554,19 +639,8 @@ async function reconcilePackage(ecoDbName, apiName, pkg) {
 
   // Fetch every upstream entry for this package (paginated — single packages are
   // usually one page, but long histories can exceed pageSize).
-  const items = [];
-  const upstreamKeys = new Set();
-  let pageToken = null;
-  do {
-    const params = new URLSearchParams({ ecosystem: apiName, packageName: pkg, pageSize: '500' });
-    if (pageToken) params.set('pageToken', pageToken);
-    const data = await malwareApiGet(params, `pkg-check ${apiName} ${pkg}`);
-    for (const it of (data.items || [])) {
-      items.push(it);
-      upstreamKeys.add(malKey(it.packageName, it.version, it.malid, it.blockedAt));
-    }
-    pageToken = data.nextPageToken || null;
-  } while (pageToken);
+  const items = await fetchPackageBlocklist(apiName, pkg);
+  const upstreamKeys = new Set(items.map(it => malKey(it.packageName, it.version, it.malid, it.blockedAt)));
 
   // Reached only if the full page-through succeeded (malwareApiGet throws otherwise),
   // so upstreamKeys is complete and safe to delete against.
@@ -599,9 +673,20 @@ async function runMalwareSync({ token, full = false }) {
   Object.assign(syncState, {
     running: true, fetched: 0, total: 0, error: null,
     startedAt: new Date().toISOString(), finishedAt: null,
-    windowsDone: 0, windowsTotal: 0, cancelled: false,
+    windowsDone: 0, windowsTotal: 0, cancelled: false, expectedTotal: 0,
   });
   await ensurePlatformTokenFresh(); // avoid a mid-sync 401 truncating a page-through
+
+  // For a full/cold rebuild, probe the upstream total up front so /readyz can
+  // report a warmup percentage/ETA. Cheap (one pageSize=1 call per ecosystem);
+  // skipped for delta syncs where it isn't worth the latency.
+  if (full || !malwareWarm) {
+    try {
+      let expected = 0;
+      for (const { apiName } of PLATFORM_ECOSYSTEMS) expected += await malwareTotalCountSince(apiName, MALWARE_EPOCH);
+      syncState.expectedTotal = expected;
+    } catch { /* best-effort; percentage just stays unknown */ }
+  }
 
   async function syncOneEcosystem({ apiName, dbName }) {
     if (syncState.cancelled) return;
@@ -636,6 +721,7 @@ async function runMalwareSync({ token, full = false }) {
       await syncOneEcosystem(eco);
     }
     db.prepare(`INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_sync_at', ?)`).run(new Date().toISOString());
+    if (!syncState.cancelled) malwareWarm = true; // mirror is now usable from local
     // Always fetch publish dates after a sync — the enrich pass only touches rows
     // with published_at IS NULL, so this is a no-op once everything is enriched.
     // Fire-and-forget; progress is exposed via /api/cgr-malware/enrich/status.
@@ -702,6 +788,22 @@ Bun.serve({
 
     if (url.pathname === '/') {
       return new Response(Bun.file(htmlPath), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+
+    // Readiness / warmup probe. 200 once the mirror is warm (usable from local),
+    // 503 while the first fill is still in progress; reports percent/ETA.
+    if (url.pathname === '/readyz') {
+      const total = db.prepare(`SELECT COUNT(*) AS n FROM malware`).get().n;
+      const expected = syncState.expectedTotal || 0;
+      const percent = malwareWarm ? 100 : (expected ? Math.min(99, Math.round(syncState.fetched / expected * 100)) : 0);
+      let etaSeconds = null;
+      if (!malwareWarm && syncState.running && expected && syncState.startedAt) {
+        const elapsed = (Date.now() - Date.parse(syncState.startedAt)) / 1000;
+        const rate = syncState.fetched / Math.max(1, elapsed); // rows/sec
+        if (rate > 0) etaSeconds = Math.round((expected - syncState.fetched) / rate);
+      }
+      const body = { warm: malwareWarm, syncing: syncState.running, fetched: syncState.fetched, expectedTotal: expected || null, percent, etaSeconds, total };
+      return new Response(JSON.stringify(body), { status: malwareWarm ? 200 : 503, headers: { 'Content-Type': 'application/json' } });
     }
 
     // npm / JS proxy
@@ -1257,19 +1359,30 @@ Bun.serve({
       // Maven coordinates are `group:artifact` upstream and in-DB, but the UI passes
       // `group/artifact` — normalise so both the lookup and reconcile match.
       const pkg = ecoDbName === 'Maven' ? rawPkg.replace('/', ':') : rawPkg;
-      if (!pkg) return new Response(JSON.stringify({ rows: [] }), { headers: { 'Content-Type': 'application/json' } });
-      // Self-heal against the live API (apiName === dbName for all three ecosystems)
-      // so cleared/added entries reconcile without waiting for a full sync. Best-effort:
-      // on any API failure, fall through to whatever we have locally.
-      try { await reconcilePackage(ecoDbName, ecoDbName, pkg); }
-      catch (err) { console.warn(`[pkg-check] reconcile failed for ${ecoDbName} ${pkg}: ${err.message}`); }
-      const rows = db.prepare(`
+      if (!pkg) return new Response(JSON.stringify({ rows: [], cooldown: {} }), { headers: { 'Content-Type': 'application/json' } });
+
+      const readLocal = () => db.prepare(`
         SELECT package_name, version, scope, malid, source, blocked_at, reason_json, description
-        FROM malware
-        WHERE ecosystem = ? AND package_name = ?
-      `).all(ecoDbName, pkg);
-      const out = rows.map(r => ({ ...r, reason: JSON.parse(r.reason_json || '[]'), reason_json: undefined }));
-      return new Response(JSON.stringify({ rows: out }), { headers: { 'Content-Type': 'application/json' } });
+        FROM malware WHERE ecosystem = ? AND package_name = ?
+      `).all(ecoDbName, pkg).map(r => ({ ...r, reason: JSON.parse(r.reason_json || '[]'), reason_json: undefined }));
+
+      let out;
+      if (!malwareWarm) {
+        // Cold mirror (first fill in progress): serve live so results are correct
+        // now instead of sparse. Read-only — doesn't touch the DB. Falls back to
+        // whatever local data exists if the live call fails.
+        const live = await liveMalwareLookup(ecoDbName, ecoDbName, pkg).catch(() => null);
+        out = live || readLocal();
+      } else {
+        // Warm: self-heal against the live API (apiName === dbName for all three)
+        // so cleared/added entries reconcile without a full sync. Best-effort.
+        try { await reconcilePackage(ecoDbName, ecoDbName, pkg); }
+        catch (err) { console.warn(`[pkg-check] reconcile failed for ${ecoDbName} ${pkg}: ${err.message}`); }
+        out = readLocal();
+      }
+      // Authoritative per-version unblock times (org's own blocked pulls), best-effort.
+      const cooldown = await authoritativeCooldown(ecoParam, pkg).catch(() => ({}));
+      return new Response(JSON.stringify({ rows: out, cooldown }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Bulk malware check for a list of package names (used by the Lockfile Scan

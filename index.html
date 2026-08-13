@@ -1332,20 +1332,30 @@ function cooldownInfo(eco, published) {
 
 // Cooldown badge for the Chainguard column. Only meaningful when the version is
 // NOT yet in Chainguard (an in-cooldown version is withheld), so callers pass it
-// through only for the not-available (✗) case.
-function cooldownBadgeHtml(eco, published) {
-  const ci = cooldownInfo(eco, published);
-  if (!ci) return '';
-  const left = ci.until - Date.now();
+// through only for the not-available (✗) case. Prefers the authoritative unblock
+// time from the org's own blocked-pull events, falling back to the estimate
+// (publish date + policy window).
+function cooldownBadgeHtml(eco, published, authoritativeUntil) {
+  const pol = libPolicy?.enabled ? libPolicy.ecosystems?.[eco] : null;
+  if (!pol || !pol.cooldownDays) return '';
+  let until = null, confirmed = false;
+  if (authoritativeUntil) {
+    const t = typeof authoritativeUntil === 'number' ? authoritativeUntil : Date.parse(authoritativeUntil);
+    if (t && Date.now() < t) { until = t; confirmed = true; }
+  }
+  if (!until) { const ci = cooldownInfo(eco, published); if (ci) until = ci.until; }
+  if (!until || Date.now() >= until) return '';
+  const left = until - Date.now();
   const d = Math.floor(left / 86400000);
   const h = Math.floor((left % 86400000) / 3600000);
   const leftStr = d > 0 ? `${d}d ${h}h` : `${h}h`;
-  const availDate = new Date(ci.until).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  const availDate = new Date(until).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
   const tip = [
-    `Within your org's Chainguard cooldown window (${ci.days}-day ${ci.policyName || 'policy'}${ci.mode && ci.mode !== 'ENFORCED' ? `, ${ci.mode}` : ''}).`,
+    `Within your org's Chainguard cooldown window (${pol.cooldownDays}-day ${pol.policyName || 'policy'}${pol.mode && pol.mode !== 'ENFORCED' ? `, ${pol.mode}` : ''}).`,
     `Available ${availDate} (in ${leftStr}).`,
-  ].join('\n');
-  return `<span class="badge-cooldown" data-tip="${escHtml(tip)}">⏳ cooldown · ${leftStr}</span>`;
+    confirmed ? 'Confirmed by a blocked pull from your organization.' : null,
+  ].filter(Boolean).join('\n');
+  return `<span class="badge-cooldown" data-tip="${escHtml(tip)}">⏳ cooldown · ${leftStr}${confirmed ? ' ✓' : ''}</span>`;
 }
 
 function npmCgrCheckCell(tarball) {
@@ -1789,6 +1799,7 @@ async function npmLookup(pkg) {
   const npmData = npmRes.status === 'fulfilled' ? npmRes.value : null;
   const cgrData = cgrRes.status === 'fulfilled' ? cgrRes.value : null;
   const malRows = malRes.status === 'fulfilled' ? (malRes.value.rows || []) : [];
+  const malCooldown = malRes.status === 'fulfilled' ? (malRes.value.cooldown || {}) : {};
 
   const npmVersions = npmData?.versions || {};
   const cgrVersions = cgrData?.versions || {};
@@ -1824,6 +1835,7 @@ async function npmLookup(pkg) {
       isYanked: !!(npmTime[v] && !npmVersions[v]),
       hasInstallScripts: !!(npmVersions[v]?.scripts && Object.keys(npmVersions[v].scripts).some(k => ['preinstall', 'install', 'postinstall'].includes(k))),
       malware: malByVersion.get(v) || (malPackageWide[0] ? { ...malPackageWide[0], _packageWide: true } : null),
+      cooldownUntil: malCooldown[v] || null,
     })),
     npmError: npmRes.status === 'rejected' ? npmRes.reason : null,
     cgrError: cgrRes.status === 'rejected' ? cgrRes.reason : null,
@@ -1902,7 +1914,7 @@ function npmRenderTable(data) {
     html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
     const yankedBadge = row.isYanked ? '<span class="badge-yanked" title="Yanked/pulled from npmjs.com — usually means the maintainer (or npm) removed it after a malware report or supply-chain attack">yanked</span>' : '';
     html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${checkCell(row.npmTarball)}${yankedBadge}<span id="npm-att-${idx}"></span></div></td>`;
-    html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${npmCgrCheckCell(row.cgrTarball)}<span id="cgr-att-${idx}"></span>${npmCgrBadge(row.cgrTarball)}${row.cgrTarball ? '' : cooldownBadgeHtml('npm', row.published)}</div></td>`;
+    html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${npmCgrCheckCell(row.cgrTarball)}<span id="cgr-att-${idx}"></span>${npmCgrBadge(row.cgrTarball)}${row.cgrTarball ? '' : cooldownBadgeHtml('npm', row.published, row.cooldownUntil)}</div></td>`;
     html += `<td>${integrityCell(row.npmIntegrity, row.cgrIntegrity)}</td>`;
     html += `</tr>`;
   }
@@ -2177,6 +2189,7 @@ async function mavenLookup(group, artifact) {
   const cgrMirrorVersions = cgrMirrorRes.status === 'fulfilled' ? new Set(parseMetadataXml(cgrMirrorRes.value)) : new Set();
 
   const malRows = malRes.status === 'fulfilled' ? (malRes.value.rows || []) : [];
+  const malCooldown = malRes.status === 'fulfilled' ? (malRes.value.cooldown || {}) : {};
   const malByVersion = new Map();
   const malPackageWide = [];
   for (const m of malRows) {
@@ -2194,6 +2207,7 @@ async function mavenLookup(group, artifact) {
       inMvn: mvnVersionSet.has(v),
       cgrType: cgrBuiltVersions.has(v) ? 'built' : cgrMirrorVersions.has(v) ? 'mirror' : null,
       malware: malByVersion.get(v) || (malPackageWide[0] ? { ...malPackageWide[0], _packageWide: true } : null),
+      cooldownUntil: malCooldown[v] || null,
     })),
     mvnError: mvnMetaRes.status === 'rejected' ? mvnMetaRes.reason : null,
     cgrBuiltError:  cgrBuiltRes.status  === 'rejected' ? cgrBuiltRes.reason  : null,
@@ -2291,7 +2305,7 @@ function mavenRenderTable(data) {
     html += `<td><div class="version-cell"><code>${escHtml(row.version)}</code>${isLatest ? '<span class="badge-latest">latest</span>' : ''}${showMalware ? malwareBadgeHtml(row.malware) : ''}</div></td>`;
     html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
     html += `<td class="check-cell">${checkCell(mvnUrl)}</td>`;
-    html += `<td class="check-cell">${cgrCheckCell(row.cgrType, cgrUrl, 'maven')}${row.cgrType ? '' : cooldownBadgeHtml('maven', row.published)}</td>`;
+    html += `<td class="check-cell">${cgrCheckCell(row.cgrType, cgrUrl, 'maven')}${row.cgrType ? '' : cooldownBadgeHtml('maven', row.published, row.cooldownUntil)}</td>`;
     html += `</tr>`;
   }
   html += `</tbody></table></div>`;
@@ -2651,6 +2665,7 @@ async function pypiLookup(pkg) {
   const cgrHtml  = cgrRes.status  === 'fulfilled' ? cgrRes.value  : null;
 
   const malRows = malRes.status === 'fulfilled' ? (malRes.value.rows || []) : [];
+  const malCooldown = malRes.status === 'fulfilled' ? (malRes.value.cooldown || {}) : {};
   const malByVersion = new Map();
   const malPackageWide = [];
   for (const m of malRows) {
@@ -2691,6 +2706,7 @@ async function pypiLookup(pkg) {
           wheels:       cgrInfo.wheels,
         } : null,
         malware: malByVersion.get(v) || (malPackageWide[0] ? { ...malPackageWide[0], _packageWide: true } : null),
+        cooldownUntil: malCooldown[v] || null,
       };
     }),
     pypiError: pypiRes.status === 'rejected' ? pypiRes.reason : null,
@@ -2809,7 +2825,7 @@ function pypiRenderTable(data) {
     html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
     html += `<td class="check-cell">${checkCell(row.pypiUrl)}</td>`;
     const covered = hasCgrWheel(row);
-    html += `<td class="check-cell">${cgrCheckCell(covered ? row.cgrType : null, covered ? row.cgrTarball : null, 'pypi')}${covered ? '' : cooldownBadgeHtml('pypi', row.published)}</td>`;
+    html += `<td class="check-cell">${cgrCheckCell(covered ? row.cgrType : null, covered ? row.cgrTarball : null, 'pypi')}${covered ? '' : cooldownBadgeHtml('pypi', row.published, row.cooldownUntil)}</td>`;
     html += `<td>${pypiPlatformsCell(row.cgrPlatforms)}</td>`;
     html += `</tr>`;
   }
