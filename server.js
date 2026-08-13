@@ -455,6 +455,16 @@ const POLICY_ECO_MAP = { JAVASCRIPT: 'npm', PYTHON: 'pypi', JAVA: 'maven' };
 const POLICY_TTL = 5 * 60 * 1000;
 let policyCache = { at: 0, data: null };
 
+// Fallback cooldown windows for when the API returns no policy bindings — e.g. a
+// K8s workload identity that can't read Libraries policies. Per-ecosystem
+// COOLDOWN_DAYS_NPM/PYPI/MAVEN, else the uniform COOLDOWN_DAYS. (0/unset = none.)
+const COOLDOWN_ENV = {
+  npm: Number(process.env.COOLDOWN_DAYS_NPM) || null,
+  pypi: Number(process.env.COOLDOWN_DAYS_PYPI) || null,
+  maven: Number(process.env.COOLDOWN_DAYS_MAVEN) || null,
+};
+const COOLDOWN_DAYS_DEFAULT = Number(process.env.COOLDOWN_DAYS) || null;
+
 async function resolveLibrariesParent() {
   if (/^[0-9a-f]{40}$/i.test(LIBRARIES_ORG)) return LIBRARIES_ORG;
   const data = await consoleApiGet('/iam/v1/groups', new URLSearchParams({ name: LIBRARIES_ORG }), 'group resolve');
@@ -484,7 +494,16 @@ async function librariesPolicyData() {
         mode: (b.mode || '').replace('LIBRARY_POLICY_BINDING_MODE_', ''),
       };
     }
-    result.enabled = true;
+    const fromApi = Object.keys(result.ecosystems);
+    // Fill any ecosystem the API didn't return (e.g. identity lacks policy-read)
+    // from the env fallback so the UI can still badge in-cooldown versions.
+    for (const eco of ['npm', 'pypi', 'maven']) {
+      if (result.ecosystems[eco]) continue;
+      const days = COOLDOWN_ENV[eco] ?? COOLDOWN_DAYS_DEFAULT;
+      if (days != null) result.ecosystems[eco] = { cooldownDays: days, policyName: 'env fallback', mode: 'DEFAULT' };
+    }
+    console.log(`[libraries-policy] parent=${parent} bindings=${(bindings.items || []).length} policies=${(policies.items || []).length}; from API: [${fromApi.join(',') || 'none'}]; effective: [${Object.keys(result.ecosystems).join(',') || 'none'}]`);
+    result.enabled = Object.keys(result.ecosystems).length > 0;
     result.parent = parent;
     policyCache = { at: Date.now(), data: result };
   } catch (err) {
