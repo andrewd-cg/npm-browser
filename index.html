@@ -3868,12 +3868,13 @@ async function malRunSync({ full = false } = {}) {
   const body = { full };
   if (platformToken) body.platformToken = platformToken;
 
-  if (!platformToken) {
-    document.getElementById('mal-banners').innerHTML =
-      `<div class="banner error">No Platform API token set — paste one in Settings (Malware API section) first. Get one with: <code>chainctl auth token --audience https://console-api.enforce.dev</code></div>`;
-    return;
-  }
   document.getElementById('mal-banners').innerHTML = '';
+
+  // A browser-pasted token is optional: the server falls back to its own token,
+  // which it can self-mint via chainctl (OIDC workload identity). If it has none,
+  // the POST returns 401 and we surface the paste-a-token banner below. (Don't
+  // pre-check /status for a token — it can briefly report none while the startup
+  // chainctl mint is still in flight.)
   const progressWrap  = document.getElementById('mal-sync-progress');
   const progressFill  = document.getElementById('mal-sync-fill');
   const progressText  = document.getElementById('mal-sync-text');
@@ -3888,7 +3889,7 @@ async function malRunSync({ full = false } = {}) {
   progressCount.textContent = '';
 
   let preSyncTotal = 0;
-  try { preSyncTotal = (await fetch('/api/cgr-malware/status').then(r => r.json())).total; } catch {}
+  try { preSyncTotal = (await fetch('/api/cgr-malware/status').then(r => r.json())).total || 0; } catch {}
 
   try {
     const res = await fetch('/api/cgr-malware/sync', {
@@ -3899,6 +3900,14 @@ async function malRunSync({ full = false } = {}) {
     if (res.status === 409) {
       // A sync is already running (e.g. auto-delta-sync from page load) — attach to it
       progressText.textContent = 'Sync already running — attaching…';
+    } else if (res.status === 401) {
+      // Server has no token from any source (no paste, no chainctl/OIDC).
+      refreshBtn.disabled = false;
+      fullBtn.disabled = false;
+      progressWrap.style.display = 'none';
+      document.getElementById('mal-banners').innerHTML =
+        `<div class="banner error">No Platform API token set — paste one in Settings (Malware API section) first, or run the server with chainctl/OIDC. Get one with: <code>chainctl auth token --audience https://console-api.enforce.dev</code></div>`;
+      return;
     } else if (!res.ok) {
       const text = await res.text();
       throw new Error(text || `HTTP ${res.status}`);
