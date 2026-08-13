@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: package-browser
+  labels:
+    app: package-browser
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: package-browser
+  template:
+    metadata:
+      labels:
+        app: package-browser
+    spec:
+      # Chown both hostPath dirs once so the nonroot app container can write
+      # to them -- previously the cache dir's ownership came from whatever
+      # copied files into it; now nothing does, so this is the only step
+      # that sets it.
+      initContainers:
+        - name: init-data
+          image: cgr.dev/chainguard/wolfi-base:latest
+          imagePullPolicy: Always
+          command: ["sh", "-c", "chown 65532:65532 /data /chainctl-cache"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: chainctl-cache
+              mountPath: /chainctl-cache
+        # Native sidecar (restartPolicy: Always): starts before package-browser,
+        # then keeps running for the pod's whole lifetime. `--refresh` is
+        # chainctl's own built-in continuous-refresh mode for workloads --
+        # no homemade loop needed, and no shell required since
+        # --identity-token accepts a file path directly.
+        - name: chainctl-login
+          image: cgr.dev/chainguard/chainctl:latest
+          imagePullPolicy: Always
+          restartPolicy: Always
+          command:
+            - chainctl
+            - auth
+            - login
+            - --identity=9188682cf9821b6157bb8a00d8376efc4a2933e3/4413b84618f3e45e
+            - --identity-token=/var/run/chainguard/oidc/oidc-token
+            - --refresh
+          env:
+            - name: HOME
+              value: /home/nonroot
+          securityContext:
+            runAsUser: 65532   # matches the chown above, and the cache's expected ownership
+          volumeMounts:
+            - name: oidc-token
+              mountPath: /var/run/chainguard/oidc
+              readOnly: true
+            - name: chainctl-cache
+              mountPath: /home/nonroot/.cache/chainguard
+      containers:
+        - name: package-browser
+          image: ghcr.io/andrewd-cg/package-browser:latest-dev
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: MALWARE_DB_PATH
+              value: /data/malware.db
+            - name: TZ
+              value: Australia/Melbourne
+            - name: LIBRARIES_ORG
+              value: andrewd.dev
+            # Assumable identity UIDP (same value as the sidecar's --identity).
+            # The app sends Basic(UIDP:projected-OIDC-token) to libraries.cgr.dev,
+            # which performs the STS exchange itself -- this is what makes the
+            # npm/maven/pypi Chainguard availability checks work under workload
+            # identity (chainctl can't mint the libraries.cgr.dev audience in-pod).
+            - name: CHAINGUARD_IDENTITY
+              value: 9188682cf9821b6157bb8a00d8376efc4a2933e3/4413b84618f3e45e
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: chainctl-cache
+              mountPath: /home/nonroot/.cache/chainguard
+            # Same projected OIDC token the sidecar uses; the app reads it from
+            # /var/run/chainguard/oidc/oidc-token (default SA_TOKEN_PATH) as the
+            # libraries.cgr.dev Basic-auth password.
+            - name: oidc-token
+              mountPath: /var/run/chainguard/oidc
+              readOnly: true
+      volumes:
+        # compose: ./data:/data (relative bind mount)
+        - name: data
+          hostPath:
+            path: /opt/package-browser/data
+            type: DirectoryOrCreate
+        # chainctl's own cache dir; app writes/reads its session here directly
+        - name: chainctl-cache
+          hostPath:
+            path: /opt/package-browser/chainctl-cache
+            type: DirectoryOrCreate
+        # Kubernetes mints and auto-rotates this itself -- the actual
+        # credential the app exchanges for a Chainguard session.
+        - name: oidc-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: oidc-token
+                  expirationSeconds: 600
+                  audience: issuer.enforce.dev
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: package-browser
+spec:
+  type: NodePort
+  selector:
+    app: package-browser
+  ports:
+    - port: 3000        # ClusterIP-internal port
+      targetPort: 3000   # container port
+      nodePort: 30300    # externally reachable port on the node; must be 30000-32767
