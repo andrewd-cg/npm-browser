@@ -296,16 +296,27 @@ if (platformToken) {
   });
 }
 
-// ── Chainguard Libraries registry token (libraries.cgr.dev) ─────────────────
-// The registry accepts a short-lived Bearer token minted for its own audience —
-// exactly what `chainctl auth configure-npm` writes as the .npmrc _authToken. We
-// mint/refresh it via chainctl (OIDC workload identity) so the UI's Chainguard
-// availability checks work without pasting long-lived Basic creds. A user-supplied
-// credential from Settings still overrides. Requires the identity to hold
-// libraries.*.pull.
+// ── Chainguard Libraries registry auth (libraries.cgr.dev) ──────────────────
+// Unlike console-api, the registry doesn't want a pre-exchanged token: it takes
+// HTTP Basic where username = the assumable identity UIDP and password = the raw
+// projected OIDC token (aud=issuer.enforce.dev) — the registry performs the STS
+// exchange itself. This is what makes it work under K8s workload identity where
+// chainctl can't mint the libraries.cgr.dev audience non-interactively.
+//   Set CHAINGUARD_IDENTITY (identity UIDP) + mount the projected token at
+//   SA_TOKEN_PATH. A user-supplied Basic credential from Settings still overrides,
+//   and CGR_REGISTRY_TOKEN (bearer) / chainctl are kept as fallbacks for other envs.
+const CHAINGUARD_IDENTITY = process.env.CHAINGUARD_IDENTITY || '';
+const SA_TOKEN_PATH = process.env.SA_TOKEN_PATH || '/var/run/chainguard/oidc/oidc-token';
 const REGISTRY_AUDIENCE = 'libraries.cgr.dev';
 let registryToken = process.env.CGR_REGISTRY_TOKEN || null;
 let registryTokenExpiry = registryToken ? parsePlatformTokenExpiry(registryToken) : null;
+let registryHeaderCache = { header: null, refreshAt: 0 }; // Basic(UIDP:oidc), rebuilt every 60s
+
+async function readProjectedToken() {
+  try { return (await Bun.file(SA_TOKEN_PATH).text()).trim(); }
+  catch { return null; }
+}
+
 let registryRefreshInFlight = null;
 function refreshRegistryTokenViaChainctl() {
   if (registryRefreshInFlight) return registryRefreshInFlight;
@@ -319,7 +330,6 @@ function refreshRegistryTokenViaChainctl() {
       if (!token) throw new Error('empty token');
       registryToken = token;
       registryTokenExpiry = parsePlatformTokenExpiry(token);
-      console.log('Registry token refreshed via chainctl, expires', registryTokenExpiry ? new Date(registryTokenExpiry).toISOString() : 'unknown');
       return token;
     } catch (err) {
       console.error('chainctl registry token refresh failed:', err.message);
@@ -336,12 +346,27 @@ async function ensureRegistryTokenFresh(minMs = 5 * 60 * 1000) {
   return registryToken;
 }
 
-// Authorization header for a libraries.cgr.dev request: a user-supplied Basic
-// credential (from Settings) wins; otherwise the short-lived minted Bearer token.
+// Authorization header for a libraries.cgr.dev request. Priority:
+//   1. user-supplied Basic creds from Settings,
+//   2. workload identity: Basic(UIDP : projected OIDC token) — registry does STS,
+//   3. bearer from CGR_REGISTRY_TOKEN env or a chainctl-minted registry token.
 async function cgrHeaders(req) {
   const user = req.headers.get('x-cgr-user') || '';
   const pass = req.headers.get('x-cgr-pass') || '';
   if (user) return { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') };
+
+  if (CHAINGUARD_IDENTITY) {
+    const now = Date.now();
+    if (registryHeaderCache.header && now < registryHeaderCache.refreshAt) return { 'Authorization': registryHeaderCache.header };
+    const idToken = await readProjectedToken(); // kubelet rotates this file in place
+    if (idToken) {
+      const header = 'Basic ' + Buffer.from(`${CHAINGUARD_IDENTITY}:${idToken}`).toString('base64');
+      registryHeaderCache = { header, refreshAt: now + 60000 };
+      return { 'Authorization': header };
+    }
+    console.warn(`[cgr] CHAINGUARD_IDENTITY set but no projected token at ${SA_TOKEN_PATH}`);
+  }
+
   const token = await ensureRegistryTokenFresh();
   return token ? { 'Authorization': `Bearer ${token}` } : {};
 }
