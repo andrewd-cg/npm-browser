@@ -569,6 +569,12 @@ async function runMalwareSync({ token, full = false }) {
       await syncOneEcosystem(eco);
     }
     db.prepare(`INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_sync_at', ?)`).run(new Date().toISOString());
+    // Always fetch publish dates after a sync — the enrich pass only touches rows
+    // with published_at IS NULL, so this is a no-op once everything is enriched.
+    // Fire-and-forget; progress is exposed via /api/cgr-malware/enrich/status.
+    if (!syncState.cancelled && !enrichState.running) {
+      runMalwareEnrich().catch(err => console.error('[malware-sync] auto-enrich failed:', err.message));
+    }
   } catch (err) {
     syncState.error = err.message;
     throw err;
@@ -577,6 +583,46 @@ async function runMalwareSync({ token, full = false }) {
     syncState.finishedAt = new Date().toISOString();
   }
 }
+
+// ── Scheduled sync ──────────────────────────────────────────────────────────
+// Daily full resync at 03:00 (server-local time; set the TZ env var to control
+// the zone). Disable with MALWARE_AUTOSYNC=off.
+async function triggerScheduledSync({ full }) {
+  const kind = full ? 'full' : 'delta';
+  if (syncState.running) { console.log(`[scheduler] ${kind} sync skipped — a sync is already running`); return; }
+  await ensurePlatformTokenFresh();
+  if (!platformToken) { console.warn(`[scheduler] ${kind} sync skipped — no platform token (chainctl/OIDC or paste one)`); return; }
+  try {
+    console.log(`[scheduler] starting ${kind} sync`);
+    await runMalwareSync({ token: platformToken, full }); // auto-enriches on success
+    console.log(`[scheduler] ${kind} sync finished`);
+  } catch (err) {
+    console.error(`[scheduler] ${kind} sync failed:`, err.message);
+  }
+}
+
+function scheduleMalwareJobs() {
+  if ((process.env.MALWARE_AUTOSYNC || '').toLowerCase() === 'off') {
+    console.log('[scheduler] auto-sync disabled (MALWARE_AUTOSYNC=off)');
+    return;
+  }
+  // Daily full resync at 03:00 local time; reschedule after each run so it
+  // survives DST shifts and doesn't drift.
+  const scheduleDailyFull = () => {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(3, 0, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    const delay = next - now;
+    console.log(`[scheduler] next full resync at ${next.toString()} (in ${Math.round(delay / 60000)} min)`);
+    setTimeout(async () => {
+      await triggerScheduledSync({ full: true });
+      scheduleDailyFull();
+    }, delay);
+  };
+  scheduleDailyFull();
+}
+scheduleMalwareJobs();
 
 const statsCache = new Map(); // key → { result, expiresAt }
 const STATS_TTL = 30000; // 30 seconds

@@ -1038,7 +1038,6 @@
     <!-- enrichment bar -->
     <div class="lag-enrich-bar" id="lag-enrich-bar">
       <span id="lag-enriched-count" style="flex:1">—</span>
-      <button type="button" class="copy-btn" id="lag-enrich-btn">Fetch publish dates</button>
     </div>
     <div class="mal-bar" id="lag-enrich-progress" style="display:none; margin-bottom:0.75rem;">
       <span id="lag-enrich-text" style="font-size:0.82rem;color:#64748b;">Fetching publish dates…</span>
@@ -4077,7 +4076,7 @@ async function lagLoadStats() {
 
   if (enrich) {
     document.getElementById('lag-enriched-count').textContent =
-      enrich.total > 0 ? `${enrich.enriched.toLocaleString()} / ${enrich.total.toLocaleString()} publish dates known · ${enrich.unavailable.toLocaleString()} not found` : 'No publish dates yet — click Fetch publish dates';
+      enrich.total > 0 ? `${enrich.enriched.toLocaleString()} / ${enrich.total.toLocaleString()} publish dates known · ${enrich.unavailable.toLocaleString()} not found` : 'No publish dates yet — fetched automatically after each sync';
     if (enrich.enrichState?.running) lagAttachEnrichPolling();
   }
 
@@ -4159,9 +4158,8 @@ let _lagEnrichPolling = false;
 function lagAttachEnrichPolling() {
   if (_lagEnrichPolling) return;
   _lagEnrichPolling = true;
-  const btn = document.getElementById('lag-enrich-btn');
   const progressWrap = document.getElementById('lag-enrich-progress');
-  btn.disabled = true;
+  document.getElementById('lag-enrich-text').textContent = 'Fetching publish dates…';
   progressWrap.style.display = 'flex';
   (async () => {
     while (true) {
@@ -4180,27 +4178,10 @@ function lagAttachEnrichPolling() {
       await new Promise(r => setTimeout(r, 800));
     }
     _lagEnrichPolling = false;
-    btn.disabled = false;
     setTimeout(() => { progressWrap.style.display = 'none'; }, 800);
     lagScheduleStats(true);
   })();
 }
-
-document.getElementById('lag-enrich-btn').addEventListener('click', async () => {
-  const btn = document.getElementById('lag-enrich-btn');
-  btn.disabled = true;
-  document.getElementById('lag-enrich-text').textContent = 'Fetching publish dates…';
-  document.getElementById('lag-enrich-fill').style.width = '0%';
-  document.getElementById('lag-enrich-count').textContent = '';
-  try {
-    const res = await fetch('/api/cgr-malware/enrich', { method: 'POST' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    lagAttachEnrichPolling();
-  } catch (err) {
-    btn.disabled = false;
-    document.getElementById('lag-banners').innerHTML = `<div class="banner error">Enrichment failed: ${escHtml(err.message)}</div>`;
-  }
-});
 
 document.getElementById('lag-drilldown-close').addEventListener('click', () => {
   _lagActiveBucket = null;
