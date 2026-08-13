@@ -368,8 +368,9 @@ async function consoleApiGet(path, params, ctx = '') {
 // Chainguard withholds package versions younger than a per-ecosystem "cooldown"
 // window (age_days < cooldown_days). The window comes from the org's policy
 // bindings; we resolve it once and cache it so the UI can badge in-cooldown
-// versions. Set LIBRARIES_ORG to the org name or group UIDP.
-const LIBRARIES_ORG = process.env.LIBRARIES_ORG || 'andrewd.dev';
+// versions. Set LIBRARIES_ORG to the org name or group UIDP to enable this;
+// when unset the cooldown feature is simply off (no badges).
+const LIBRARIES_ORG = process.env.LIBRARIES_ORG || null;
 const POLICY_ECO_MAP = { JAVASCRIPT: 'npm', PYTHON: 'pypi', JAVA: 'maven' };
 const POLICY_TTL = 5 * 60 * 1000;
 let policyCache = { at: 0, data: null };
@@ -383,6 +384,7 @@ async function resolveLibrariesParent() {
 async function librariesPolicyData() {
   if (policyCache.data && Date.now() - policyCache.at < POLICY_TTL) return policyCache.data;
   const result = { enabled: false, org: LIBRARIES_ORG, ecosystems: {} };
+  if (!LIBRARIES_ORG) return result; // no org configured → feature off
   if (!platformToken) return result; // no token → feature off (don't cache)
   try {
     const parent = await resolveLibrariesParent();
