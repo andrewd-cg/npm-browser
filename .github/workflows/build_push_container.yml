@@ -16,6 +16,18 @@ jobs:
       packages: write
       id-token: write
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Normal image: bun:latest base, tags sha-<sha> + latest.
+          - bun_tag: latest
+            flavor: ""
+          # -dev image: bun:latest-dev base, same tags with -dev appended
+          # (sha-<sha>-dev + latest-dev).
+          - bun_tag: latest-dev
+            flavor: "suffix=-dev,onlatest=true"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +52,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          flavor: ${{ matrix.flavor }}
           tags: |
             type=sha,prefix=sha-
             type=raw,value=latest
@@ -50,5 +63,7 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            BUN_TAG=${{ matrix.bun_tag }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
