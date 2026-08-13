@@ -296,6 +296,56 @@ if (platformToken) {
   });
 }
 
+// ── Chainguard Libraries registry token (libraries.cgr.dev) ─────────────────
+// The registry accepts a short-lived Bearer token minted for its own audience —
+// exactly what `chainctl auth configure-npm` writes as the .npmrc _authToken. We
+// mint/refresh it via chainctl (OIDC workload identity) so the UI's Chainguard
+// availability checks work without pasting long-lived Basic creds. A user-supplied
+// credential from Settings still overrides. Requires the identity to hold
+// libraries.*.pull.
+const REGISTRY_AUDIENCE = 'libraries.cgr.dev';
+let registryToken = process.env.CGR_REGISTRY_TOKEN || null;
+let registryTokenExpiry = registryToken ? parsePlatformTokenExpiry(registryToken) : null;
+let registryRefreshInFlight = null;
+function refreshRegistryTokenViaChainctl() {
+  if (registryRefreshInFlight) return registryRefreshInFlight;
+  registryRefreshInFlight = (async () => {
+    try {
+      const proc = Bun.spawn(['chainctl', 'auth', 'token', '--audience', REGISTRY_AUDIENCE], { stdout: 'pipe', stderr: 'pipe' });
+      const text = await new Response(proc.stdout).text();
+      const code = await proc.exited;
+      if (code !== 0) throw new Error(`chainctl exited ${code}`);
+      const token = text.trim();
+      if (!token) throw new Error('empty token');
+      registryToken = token;
+      registryTokenExpiry = parsePlatformTokenExpiry(token);
+      console.log('Registry token refreshed via chainctl, expires', registryTokenExpiry ? new Date(registryTokenExpiry).toISOString() : 'unknown');
+      return token;
+    } catch (err) {
+      console.error('chainctl registry token refresh failed:', err.message);
+      return null;
+    }
+  })();
+  registryRefreshInFlight.finally(() => { registryRefreshInFlight = null; });
+  return registryRefreshInFlight;
+}
+async function ensureRegistryTokenFresh(minMs = 5 * 60 * 1000) {
+  if (!registryToken || (registryTokenExpiry && registryTokenExpiry - Date.now() < minMs)) {
+    await refreshRegistryTokenViaChainctl();
+  }
+  return registryToken;
+}
+
+// Authorization header for a libraries.cgr.dev request: a user-supplied Basic
+// credential (from Settings) wins; otherwise the short-lived minted Bearer token.
+async function cgrHeaders(req) {
+  const user = req.headers.get('x-cgr-user') || '';
+  const pass = req.headers.get('x-cgr-pass') || '';
+  if (user) return { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') };
+  const token = await ensureRegistryTokenFresh();
+  return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
+
 // ── Malware sync ──────────────────────────────────────────────────────────────
 
 const syncState = { running: false, fetched: 0, total: 0, error: null, startedAt: null, finishedAt: null, windowsDone: 0, windowsTotal: 0, cancelled: false, expectedTotal: 0 };
@@ -809,10 +859,8 @@ Bun.serve({
     // npm / JS proxy
     if (url.pathname.startsWith('/api/cgr/')) {
       const pkg = url.pathname.slice('/api/cgr/'.length);
-      const user = req.headers.get('x-cgr-user') || '';
-      const pass = req.headers.get('x-cgr-pass') || '';
       const upstream = `https://libraries.cgr.dev/javascript/${pkg}`;
-      const headers = user ? { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') } : {};
+      const headers = await cgrHeaders(req);
       try {
         const res = await fetch(upstream, { headers });
         const body = await res.text();
@@ -825,10 +873,8 @@ Bun.serve({
     // CGR authenticated download proxy (streams tarball back as attachment)
     if (url.pathname.startsWith('/api/cgr-download/')) {
       const path = url.pathname.slice('/api/cgr-download/'.length);
-      const user = req.headers.get('x-cgr-user') || '';
-      const pass = req.headers.get('x-cgr-pass') || '';
       const upstream = `https://libraries.cgr.dev/${path}`;
-      const headers = user ? { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') } : {};
+      const headers = await cgrHeaders(req);
       try {
         const res = await fetch(upstream, { headers });
         const filename = path.split('/').pop() || 'download';
@@ -847,10 +893,8 @@ Bun.serve({
     // CGR npm attestations proxy
     if (url.pathname.startsWith('/api/cgr-attestations/')) {
       const path = url.pathname.slice('/api/cgr-attestations/'.length);
-      const user = req.headers.get('x-cgr-user') || '';
-      const pass = req.headers.get('x-cgr-pass') || '';
       const upstream = `https://libraries.cgr.dev/javascript/-/npm/v1/attestations/${path}`;
-      const headers = user ? { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') } : {};
+      const headers = await cgrHeaders(req);
       try {
         const res = await fetch(upstream, { headers });
         const body = await res.text();
@@ -865,9 +909,7 @@ Bun.serve({
       const pkg = url.searchParams.get('pkg');
       const version = url.searchParams.get('version');
       if (!pkg || !version) return new Response('Missing pkg or version', { status: 400 });
-      const user = req.headers.get('x-cgr-user') || '';
-      const pass = req.headers.get('x-cgr-pass') || '';
-      const cgrAuthHeaders = user ? { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') } : {};
+      const cgrAuthHeaders = await cgrHeaders(req);
       const pkgVer = `${pkg}@${version}`;
 
       function extractCommitFromPayload(payload, predicateType) {
@@ -1016,12 +1058,10 @@ Bun.serve({
       const group = url.searchParams.get('group');
       const artifact = url.searchParams.get('artifact');
       const repo = url.searchParams.get('repo') || 'java';
-      const user = req.headers.get('x-cgr-user') || '';
-      const pass = req.headers.get('x-cgr-pass') || '';
       if (!group || !artifact) return new Response('Missing group or artifact', { status: 400 });
       const groupPath = group.replace(/\./g, '/');
       const upstream = `https://libraries.cgr.dev/${repo}/${groupPath}/${artifact}/maven-metadata.xml`;
-      const headers = user ? { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') } : {};
+      const headers = await cgrHeaders(req);
       try {
         const res = await fetch(upstream, { headers });
         const body = await res.text();
@@ -1071,10 +1111,8 @@ Bun.serve({
     // PyPI / Python CGR proxy — PEP 503 simple index
     if (url.pathname.startsWith('/api/cgr-python/')) {
       const path = url.pathname.slice('/api/cgr-python/'.length);
-      const user = req.headers.get('x-cgr-user') || '';
-      const pass = req.headers.get('x-cgr-pass') || '';
       const upstream = `https://libraries.cgr.dev/python/${path}`;
-      const headers = user ? { 'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') } : {};
+      const headers = await cgrHeaders(req);
       try {
         const res = await fetch(upstream, { headers });
         const body = await res.text();
