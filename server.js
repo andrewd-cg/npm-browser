@@ -343,8 +343,73 @@ function insertItems(items, ecoName) {
   syncState.fetched += items.length;
 }
 
-const MALWARE_API_BASE = 'https://console-api.enforce.dev/libraries/v1/malware/blocklist';
+const CONSOLE_API_BASE = 'https://console-api.enforce.dev';
+const MALWARE_API_BASE = `${CONSOLE_API_BASE}/libraries/v1/malware/blocklist`;
 const MALWARE_EPOCH = '2026-01-01T00:00:00Z';
+
+// Generic console-api GET with 401→chainctl-refresh and transient-5xx/429 retry.
+async function consoleApiGet(path, params, ctx = '') {
+  const qs = params ? `?${params}` : '';
+  for (let attempt = 1; ; attempt++) {
+    let res = await fetch(`${CONSOLE_API_BASE}${path}${qs}`, { headers: { Authorization: `Bearer ${platformToken}` } });
+    if (res.status === 401) {
+      const refreshed = await refreshPlatformTokenViaChainctl();
+      if (!refreshed) throw new Error(`HTTP 401 from console-api (${ctx}) — token refresh failed`);
+      res = await fetch(`${CONSOLE_API_BASE}${path}${qs}`, { headers: { Authorization: `Bearer ${platformToken}` } });
+    }
+    if (res.ok) return res.json();
+    if ((res.status >= 500 || res.status === 429) && attempt <= 3) { await new Promise(r => setTimeout(r, 1000 * attempt)); continue; }
+    const body = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} from console-api (${ctx})${body ? `: ${body.slice(0, 200)}` : ''}`);
+  }
+}
+
+// ── Libraries cooldown policy ───────────────────────────────────────────────
+// Chainguard withholds package versions younger than a per-ecosystem "cooldown"
+// window (age_days < cooldown_days). The window comes from the org's policy
+// bindings; we resolve it once and cache it so the UI can badge in-cooldown
+// versions. Set LIBRARIES_ORG to the org name or group UIDP.
+const LIBRARIES_ORG = process.env.LIBRARIES_ORG || 'andrewd.dev';
+const POLICY_ECO_MAP = { JAVASCRIPT: 'npm', PYTHON: 'pypi', JAVA: 'maven' };
+const POLICY_TTL = 5 * 60 * 1000;
+let policyCache = { at: 0, data: null };
+
+async function resolveLibrariesParent() {
+  if (/^[0-9a-f]{40}$/i.test(LIBRARIES_ORG)) return LIBRARIES_ORG;
+  const data = await consoleApiGet('/iam/v1/groups', new URLSearchParams({ name: LIBRARIES_ORG }), 'group resolve');
+  return (data.items || []).find(g => g.name === LIBRARIES_ORG)?.id || null;
+}
+
+async function librariesPolicyData() {
+  if (policyCache.data && Date.now() - policyCache.at < POLICY_TTL) return policyCache.data;
+  const result = { enabled: false, org: LIBRARIES_ORG, ecosystems: {} };
+  if (!platformToken) return result; // no token → feature off (don't cache)
+  try {
+    const parent = await resolveLibrariesParent();
+    if (!parent) { console.warn(`[libraries-policy] could not resolve org '${LIBRARIES_ORG}'`); return result; }
+    const [bindings, policies] = await Promise.all([
+      consoleApiGet('/libraries/v1/policy-bindings', new URLSearchParams({ parent_id: parent }), 'policy-bindings'),
+      consoleApiGet('/libraries/v1/policies', new URLSearchParams({ parent_id: parent }), 'policies'),
+    ]);
+    const byId = new Map((policies.items || []).map(p => [p.id, p]));
+    for (const b of (bindings.items || [])) {
+      const eco = POLICY_ECO_MAP[b.ecosystem];
+      if (!eco) continue;
+      const pol = byId.get(b.policy);
+      result.ecosystems[eco] = {
+        cooldownDays: pol?.cooldownDays ?? 7, // Chainguard system default when unset; 0 disables
+        policyName: pol?.name || null,
+        mode: (b.mode || '').replace('LIBRARY_POLICY_BINDING_MODE_', ''),
+      };
+    }
+    result.enabled = true;
+    result.parent = parent;
+    policyCache = { at: Date.now(), data: result };
+  } catch (err) {
+    console.error('[libraries-policy] fetch failed:', err.message);
+  }
+  return result;
+}
 // Identity key matching the malware PRIMARY KEY (normalised the same way insertItems stores).
 const malKey = (pkg, ver, malid, blockedAt) => `${pkg} ${ver ?? ''} ${malid ?? ''} ${blockedAt}`;
 
@@ -919,6 +984,12 @@ Bun.serve({
     // Malware cache status
     if (url.pathname === '/api/cgr-malware/status') {
       return new Response(JSON.stringify(malwareStatus()), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Per-ecosystem cooldown windows (from the org's Libraries policy bindings),
+    // used by the UI to badge versions still within their cooldown period.
+    if (url.pathname === '/api/libraries/policy') {
+      return new Response(JSON.stringify(await librariesPolicyData()), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Platform token management

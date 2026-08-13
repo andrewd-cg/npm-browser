@@ -621,6 +621,22 @@
     cursor: help;
     border: 1px solid #fca5a5;
   }
+  .badge-cooldown {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: #fef9c3;
+    color: #854d0e;
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 99px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    cursor: help;
+    border: 1px solid #fde047;
+    white-space: nowrap;
+  }
   /* ── Lockfile Scan ─────────────────────────────────────────────────────── */
   .scan-summary { display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:1rem; }
   .scan-card {
@@ -1298,6 +1314,40 @@ function malwareBadgeHtml(m) {
   return `<span class="badge-malware" title="${escHtml(parts.join('\n'))}">malware</span>`;
 }
 
+// Per-ecosystem cooldown windows from the org's Libraries policy (fetched once).
+// Chainguard withholds versions younger than the window, so a recently-published
+// version shows a cooldown badge in the Chainguard column until it ages out.
+let libPolicy = null;
+fetch('/api/libraries/policy').then(r => r.json()).then(p => { libPolicy = p; }).catch(() => {});
+
+function cooldownInfo(eco, published) {
+  const pol = libPolicy?.enabled ? libPolicy.ecosystems?.[eco] : null;
+  if (!pol || !pol.cooldownDays || !published) return null;
+  const pubMs = typeof published === 'number' ? published : Date.parse(published);
+  if (!pubMs) return null;
+  const until = pubMs + pol.cooldownDays * 86400000;
+  if (Date.now() >= until) return null; // aged out
+  return { until, days: pol.cooldownDays, mode: pol.mode, policyName: pol.policyName };
+}
+
+// Cooldown badge for the Chainguard column. Only meaningful when the version is
+// NOT yet in Chainguard (an in-cooldown version is withheld), so callers pass it
+// through only for the not-available (✗) case.
+function cooldownBadgeHtml(eco, published) {
+  const ci = cooldownInfo(eco, published);
+  if (!ci) return '';
+  const left = ci.until - Date.now();
+  const d = Math.floor(left / 86400000);
+  const h = Math.floor((left % 86400000) / 3600000);
+  const leftStr = d > 0 ? `${d}d ${h}h` : `${h}h`;
+  const availDate = new Date(ci.until).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  const tip = [
+    `Within your org's Chainguard cooldown window (${ci.days}-day ${ci.policyName || 'policy'}${ci.mode && ci.mode !== 'ENFORCED' ? `, ${ci.mode}` : ''}).`,
+    `Available ${availDate} (in ${leftStr}).`,
+  ].join('\n');
+  return `<span class="badge-cooldown" data-tip="${escHtml(tip)}">⏳ cooldown · ${leftStr}</span>`;
+}
+
 function npmCgrCheckCell(tarball) {
   if (!tarball) return `<span class="cross" title="Not available">✗</span>`;
   return `<a class="check-link cgr-dl" data-eco="npm" href="${escHtml(tarball)}" title="Download ${escHtml(tarball)}">✓</a>`;
@@ -1852,7 +1902,7 @@ function npmRenderTable(data) {
     html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
     const yankedBadge = row.isYanked ? '<span class="badge-yanked" title="Yanked/pulled from npmjs.com — usually means the maintainer (or npm) removed it after a malware report or supply-chain attack">yanked</span>' : '';
     html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${checkCell(row.npmTarball)}${yankedBadge}<span id="npm-att-${idx}"></span></div></td>`;
-    html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${npmCgrCheckCell(row.cgrTarball)}<span id="cgr-att-${idx}"></span>${npmCgrBadge(row.cgrTarball)}</div></td>`;
+    html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${npmCgrCheckCell(row.cgrTarball)}<span id="cgr-att-${idx}"></span>${npmCgrBadge(row.cgrTarball)}${row.cgrTarball ? '' : cooldownBadgeHtml('npm', row.published)}</div></td>`;
     html += `<td>${integrityCell(row.npmIntegrity, row.cgrIntegrity)}</td>`;
     html += `</tr>`;
   }
@@ -2241,7 +2291,7 @@ function mavenRenderTable(data) {
     html += `<td><div class="version-cell"><code>${escHtml(row.version)}</code>${isLatest ? '<span class="badge-latest">latest</span>' : ''}${showMalware ? malwareBadgeHtml(row.malware) : ''}</div></td>`;
     html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
     html += `<td class="check-cell">${checkCell(mvnUrl)}</td>`;
-    html += `<td class="check-cell">${cgrCheckCell(row.cgrType, cgrUrl, 'maven')}</td>`;
+    html += `<td class="check-cell">${cgrCheckCell(row.cgrType, cgrUrl, 'maven')}${row.cgrType ? '' : cooldownBadgeHtml('maven', row.published)}</td>`;
     html += `</tr>`;
   }
   html += `</tbody></table></div>`;
@@ -2759,7 +2809,7 @@ function pypiRenderTable(data) {
     html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
     html += `<td class="check-cell">${checkCell(row.pypiUrl)}</td>`;
     const covered = hasCgrWheel(row);
-    html += `<td class="check-cell">${cgrCheckCell(covered ? row.cgrType : null, covered ? row.cgrTarball : null, 'pypi')}</td>`;
+    html += `<td class="check-cell">${cgrCheckCell(covered ? row.cgrType : null, covered ? row.cgrTarball : null, 'pypi')}${covered ? '' : cooldownBadgeHtml('pypi', row.published)}</td>`;
     html += `<td>${pypiPlatformsCell(row.cgrPlatforms)}</td>`;
     html += `</tr>`;
   }
