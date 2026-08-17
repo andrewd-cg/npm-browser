@@ -2585,15 +2585,16 @@ function compactPlatforms(osArchSet) {
 
 function parseCgrSimpleIndex(html) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  const versionMap = new Map(); // version → { type, url, pythons, abis, platforms, hasSdist, wheelCount, wheelFilenames }
+  // version → { built, mirror } — built (from-source) and mirror (upstream) data
+  // are accumulated separately so they never get merged into a union. The
+  // per-type accumulator: { url, pythons, abis, platforms, hasSdist, wheelCount, wheelFilenames, wheels }.
+  const raw = new Map();
 
-  function entryFor(version, type, url) {
-    let cur = versionMap.get(version);
-    if (!cur || (type === 'built' && cur.type !== 'built')) {
-      cur = { type, url, pythons: new Set(), abis: new Set(), platforms: new Set(), hasSdist: false, wheelCount: 0, wheelFilenames: [], wheels: [] };
-      versionMap.set(version, cur);
-    }
-    return cur;
+  function accFor(version, type, url) {
+    let v = raw.get(version);
+    if (!v) { v = { built: null, mirror: null }; raw.set(version, v); }
+    if (!v[type]) v[type] = { url, pythons: new Set(), abis: new Set(), platforms: new Set(), hasSdist: false, wheelCount: 0, wheelFilenames: [], wheels: [] };
+    return v[type];
   }
 
   for (const a of doc.querySelectorAll('a[href]')) {
@@ -2612,7 +2613,7 @@ function parseCgrSimpleIndex(html) {
       const platform = parts[parts.length - 1];
       const abi      = parts[parts.length - 2];
       const python   = parts[parts.length - 3];
-      const e = entryFor(version, type, url);
+      const e = accFor(version, type, url);
       python.split('.').forEach(p => e.pythons.add(p));
       abi.split('.').forEach(p => e.abis.add(p));
       platform.split('.').forEach(p => e.platforms.add(p));
@@ -2632,18 +2633,24 @@ function parseCgrSimpleIndex(html) {
       const vi = parts.findIndex(p => /^\d/.test(p));
       if (vi < 1) continue;
       const version = parts.slice(vi).join('-');
-      const e = entryFor(version, type, url);
+      const e = accFor(version, type, url);
       e.hasSdist = true;
     }
   }
 
-  // Derive grouped osArch set for compact display.
-  for (const e of versionMap.values()) {
+  // Expose built-from-source data only; fall back to mirror data for versions
+  // that have no built-from-source distribution at all.
+  const versionMap = new Map();
+  for (const [version, v] of raw) {
+    const type = v.built ? 'built' : 'mirror';
+    const e = v.built || v.mirror;
+    // Derive grouped osArch set for compact display.
     e.osArchs = new Set();
     for (const p of e.platforms) {
       const { os, arch } = classifyPlatform(p);
       e.osArchs.add(arch ? `${os}/${arch}` : os);
     }
+    versionMap.set(version, { type, ...e });
   }
   return versionMap;
 }
