@@ -2821,7 +2821,7 @@ function pypiRenderTable(data) {
       </div>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr>${sortableTh('pypi','version','Version')}${sortableTh('pypi','published','Published')}${sortableTh('pypi','pypiUrl','PyPI','text-align:center')}${sortableTh('pypi','cgrType','Chainguard','text-align:center')}<th>CGR platforms</th></tr></thead>
+      <thead><tr>${sortableTh('pypi','version','Version')}${sortableTh('pypi','published','Published')}${sortableTh('pypi','pypiUrl','PyPI','text-align:center')}${sortableTh('pypi','cgrType','Chainguard','text-align:center')}<th>CGR built from source platforms</th></tr></thead>
       <tbody>`;
 
   const showMalware = document.getElementById('pypi-show-malware').checked;
@@ -3262,7 +3262,7 @@ function bulkRenderPypi(results, el) {
     ${sortableTh('bulk','requested','Requested','color:#94a3b8;font-weight:500;text-align:left')}
     ${sortableTh('bulk','matchState','Match in CGR','text-align:left;min-width:160px;')}
     <th class="ver-slot-th" style="text-align:left">Suggested upgrade</th>
-    <th style="text-align:left">CGR platforms</th>
+    <th style="text-align:left">CGR built from source platforms</th>
   </tr></thead><tbody>`;
 
   for (const r of applySort('bulk', resolved)) {
