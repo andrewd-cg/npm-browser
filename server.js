@@ -1460,6 +1460,13 @@ Bun.serve({
       return new Response(JSON.stringify({ points }), { headers: { 'Content-Type': 'application/json' } });
     }
 
+    // Lightweight client config. `selfManagedAuth` is true when the server runs
+    // with its own workload identity (mints CGR/platform tokens itself) — the UI
+    // hides the Settings/credential panel in that case to avoid confusion.
+    if (url.pathname === '/api/config') {
+      return new Response(JSON.stringify({ selfManagedAuth: !!CHAINGUARD_IDENTITY }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
     // Malware cache status
     if (url.pathname === '/api/cgr-malware/status') {
       return new Response(JSON.stringify(malwareStatus()), { headers: { 'Content-Type': 'application/json' } });

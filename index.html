@@ -1635,6 +1635,16 @@ settingsBtn.addEventListener('click', () => {
 });
 refreshPlatformTokenStatus();
 
+// When the server has its own workload identity (mints CGR/platform tokens
+// itself), manual credential entry is unnecessary — hide Settings to avoid
+// confusion, and close the panel if it happened to be open.
+fetch('/api/config').then(r => r.json()).then(cfg => {
+  if (cfg.selfManagedAuth) {
+    settingsBtn.style.display = 'none';
+    settingsPanel.classList.remove('open');
+  }
+}).catch(() => {});
+
 const TEST_ENDPOINTS = {
   npm:   () => '/api/cgr/express',
   maven: () => '/api/cgr-java?group=org.springframework.boot&artifact=spring-boot&repo=java',
