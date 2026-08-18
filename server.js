@@ -48,11 +48,17 @@ db.exec(`
     cve          TEXT,
     ghsa         TEXT,
     aliases_json TEXT,
+    fixed_at     TEXT,            -- statement timestamp (when the fix was published)
     synced_at    TEXT NOT NULL,
     PRIMARY KEY (ecosystem, package_name, full_version, vuln_name)
   );
   CREATE INDEX IF NOT EXISTS idx_vex_pkg ON vex(ecosystem, package_name);
 `);
+// Migration: add fixed_at column if this DB predates it, then ensure its index.
+if (!db.prepare(`SELECT 1 FROM pragma_table_info('vex') WHERE name='fixed_at'`).get()) {
+  db.exec(`ALTER TABLE vex ADD COLUMN fixed_at TEXT`);
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_vex_fixed_at ON vex(fixed_at)`);
 
 // Migration: add published_at column if not present
 {
@@ -964,7 +970,7 @@ function vexPkgFromId(id) {
   return id.slice(id.indexOf('/') + 1).replace(/\.openvex\.json$/, '');
 }
 
-// Parse one OpenVEX doc into [{ fullVersion, baseVersion, vuln }].
+// Parse one OpenVEX doc into [{ fullVersion, baseVersion, vuln, fixedAt }].
 function parseVexDoc(doc) {
   const fixes = [];
   for (const s of (doc.statements || [])) {
@@ -977,12 +983,13 @@ function parseVexDoc(doc) {
       ghsa: all.find(a => /^GHSA-/i.test(a)) || null,
       aliases: all,
     };
+    const fixedAt = s.timestamp || s.last_updated || null;
     for (const p of (s.products || [])) {
       const purl = p.identifiers?.purl || '';
       const at = purl.lastIndexOf('@');
       if (at < 0) continue;
       const fullVersion = decodeURIComponent(purl.slice(at + 1));
-      fixes.push({ fullVersion, baseVersion: vexBaseVersion(fullVersion), vuln });
+      fixes.push({ fullVersion, baseVersion: vexBaseVersion(fullVersion), vuln, fixedAt });
     }
   }
   return fixes;
@@ -1043,11 +1050,11 @@ async function runVexSync() {
       db.prepare(`DELETE FROM vex`).run();
       const ins = db.prepare(`
         INSERT OR REPLACE INTO vex
-          (ecosystem, package_name, base_version, full_version, vuln_name, cve, ghsa, aliases_json, synced_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+          (ecosystem, package_name, base_version, full_version, vuln_name, cve, ghsa, aliases_json, fixed_at, synced_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
       `);
       for (const { eco, pkg, f } of rows) {
-        ins.run(eco, pkg, f.baseVersion, f.fullVersion, f.vuln.name, f.vuln.cve, f.vuln.ghsa, JSON.stringify(f.vuln.aliases || []), now);
+        ins.run(eco, pkg, f.baseVersion, f.fullVersion, f.vuln.name, f.vuln.cve, f.vuln.ghsa, JSON.stringify(f.vuln.aliases || []), f.fixedAt, now);
       }
     })();
     db.prepare(`INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('vex_last_sync_at', ?)`).run(now);
@@ -1366,6 +1373,77 @@ Bun.serve({
       if (!pkg) return new Response(JSON.stringify({ fixes: [] }), { headers: { 'Content-Type': 'application/json' } });
       const fixes = await vexFixesFor(eco, pkg);
       return new Response(JSON.stringify({ eco, package: pkg, fixes }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Browse all backported fixes, newest first. Free-text `q` matches package
+    // name or any vulnerability id (CVE / GHSA / CGA). One row per fix statement
+    // (package × vulnerability × date), with its build versions aggregated.
+    if (url.pathname === '/api/cgr-vex/browse') {
+      const eco    = url.searchParams.get('eco') || '';
+      const q      = url.searchParams.get('q')   || '';
+      const limit  = Math.min(parseInt(url.searchParams.get('limit')  || '100', 10) || 100, 500);
+      const offset = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
+
+      const where = [], args = [];
+      if (eco) { where.push('ecosystem = ?'); args.push(eco); }
+      if (q) {
+        where.push('(package_name LIKE ? OR cve LIKE ? OR ghsa LIKE ? OR vuln_name LIKE ? OR aliases_json LIKE ?)');
+        const like = `%${q}%`;
+        args.push(like, like, like, like, like);
+      }
+      const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+      const total = db.prepare(`
+        SELECT COUNT(*) AS n FROM (
+          SELECT 1 FROM vex ${whereSql} GROUP BY ecosystem, package_name, vuln_name, fixed_at
+        )
+      `).get(...args).n;
+      const rows = db.prepare(`
+        SELECT ecosystem, package_name, vuln_name,
+               MAX(cve) AS cve, MAX(ghsa) AS ghsa, MAX(aliases_json) AS aliases_json,
+               fixed_at,
+               GROUP_CONCAT(DISTINCT base_version) AS base_versions,
+               GROUP_CONCAT(DISTINCT full_version) AS full_versions
+        FROM vex ${whereSql}
+        GROUP BY ecosystem, package_name, vuln_name, fixed_at
+        ORDER BY fixed_at IS NULL, fixed_at DESC, package_name ASC
+        LIMIT ? OFFSET ?
+      `).all(...args, limit, offset);
+      const out = rows.map(r => ({
+        ecosystem: r.ecosystem,
+        package: r.package_name,
+        vuln: r.vuln_name,
+        cve: r.cve,
+        ghsa: r.ghsa,
+        aliases: JSON.parse(r.aliases_json || '[]'),
+        fixedAt: r.fixed_at,
+        baseVersions: (r.base_versions || '').split(',').filter(Boolean),
+        fullVersions: (r.full_versions || '').split(',').filter(Boolean),
+      }));
+      return new Response(JSON.stringify({ total, rows: out, limit, offset }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // New backported fixes per day (same filter shape as /browse). One fix =
+    // one (package × vulnerability) on a given day.
+    if (url.pathname === '/api/cgr-vex/histogram') {
+      const eco = url.searchParams.get('eco') || '';
+      const q   = url.searchParams.get('q')   || '';
+      const where = ['fixed_at IS NOT NULL'], args = [];
+      if (eco) { where.push('ecosystem = ?'); args.push(eco); }
+      if (q) {
+        where.push('(package_name LIKE ? OR cve LIKE ? OR ghsa LIKE ? OR vuln_name LIKE ? OR aliases_json LIKE ?)');
+        const like = `%${q}%`;
+        args.push(like, like, like, like, like);
+      }
+      const whereSql = `WHERE ${where.join(' AND ')}`;
+      const rows = db.prepare(`
+        SELECT day, COUNT(*) AS n FROM (
+          SELECT substr(fixed_at, 1, 10) AS day
+          FROM vex ${whereSql}
+          GROUP BY ecosystem, package_name, vuln_name, substr(fixed_at, 1, 10)
+        ) GROUP BY day ORDER BY day ASC
+      `).all(...args);
+      return new Response(JSON.stringify({ points: rows }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Malware cache status

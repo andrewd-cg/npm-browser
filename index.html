@@ -112,6 +112,9 @@
   .lag-stat-cell .lsc-value { font-size:1.05rem; font-weight:700; color:#1e293b; }
   .lag-stat-cell .lsc-value.good { color:#16a34a; }
   .lag-chart-wrap { background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:1rem; margin-bottom:1rem; }
+  .vex-chart-wrap { background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:0.75rem 1rem; margin-bottom:0.75rem; }
+  .vex-chart-wrap rect { transition: opacity 0.1s; }
+  .vex-chart-wrap rect:hover { opacity: 0.7; }
   .lag-chart-axis { font-size:12px; fill:#64748b; font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
   .lag-chart-count { font-size:11px; fill:#475569; font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; font-weight:600; }
   .lag-chart-bar { cursor:pointer; transition:opacity 0.1s; }
@@ -786,6 +789,7 @@
     <button class="tab-btn" data-tab="bulk">bulk check</button>
     <button class="tab-btn" data-tab="scan">Dependency Scan</button>
     <button class="tab-btn" data-tab="lag">Malware Detection</button>
+    <button class="tab-btn" data-tab="vex">Backported Fixes</button>
   </nav>
   <button id="settings-btn" title="Settings" aria-label="Settings">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -885,6 +889,7 @@
       <label class="filter-label"><input type="checkbox" id="maven-show-prerelease"> Show pre-release (alpha / beta / RC / snapshot)</label>
       <label class="filter-label"><input type="checkbox" id="maven-show-malware" checked> Show malware</label>
       <label class="filter-label"><input type="checkbox" id="maven-show-vex"> Show backported fixes</label>
+      <label class="filter-label"><input type="checkbox" id="maven-only-vex"> Only backported fixes</label>
     </div>
     <div class="banners" id="maven-banners"></div>
     <div class="results" id="maven-results">
@@ -906,6 +911,7 @@
       <label class="filter-label"><input type="checkbox" id="pypi-show-prerelease"> Show pre-release (a / b / rc / dev / post)</label>
       <label class="filter-label"><input type="checkbox" id="pypi-show-malware" checked> Show malware</label>
       <label class="filter-label"><input type="checkbox" id="pypi-show-vex"> Show backported fixes</label>
+      <label class="filter-label"><input type="checkbox" id="pypi-only-vex"> Only backported fixes</label>
     </div>
     <div class="banners" id="pypi-banners"></div>
     <div class="results" id="pypi-results">
@@ -1127,6 +1133,34 @@
       <div class="results" id="lag-table-results"></div>
     </div>
     <div class="banners" id="lag-banners"></div>
+  </div>
+
+  <!-- backported fixes (VEX) tab -->
+  <div id="tab-vex" class="tab-pane">
+    <div class="mal-bar">
+      <span><span class="mal-stat" id="vex-total">0</span> backported fixes · Last sync: <span class="mal-stat" id="vex-last-sync">never</span></span>
+      <span style="flex:1"></span>
+      <span style="font-size:0.82rem;color:#64748b;">Chainguard rebuilds upstream releases with security fixes backported. Source: <a href="https://libraries.cgr.dev/openvex/v1/all.json" target="_blank" rel="noopener" style="color:#3b82f6;">OpenVEX feed</a>.</span>
+    </div>
+    <div class="mal-bar" style="flex-wrap:wrap; gap:0.4rem 0.75rem;">
+      <div id="vex-eco-chips" style="display:flex; gap:0.25rem;">
+        <button class="mal-source-chip active" data-eco="" style="background:#475569;">All</button>
+        <button class="mal-source-chip" data-eco="pypi">PyPI</button>
+        <button class="mal-source-chip" data-eco="maven">Maven</button>
+      </div>
+      <span style="flex:1"></span>
+      <input type="text" id="vex-search" placeholder="Search package name or CVE / GHSA…" style="min-width:260px; flex:1; max-width:420px;">
+      <span><span class="mal-stat" id="vex-count">0</span> results</span>
+      <button type="button" class="copy-btn" id="vex-prev" disabled>← Prev</button>
+      <span id="vex-page-info" style="font-size:0.8rem;color:#94a3b8;">—</span>
+      <button type="button" class="copy-btn" id="vex-next" disabled>Next →</button>
+    </div>
+    <div class="vex-chart-wrap" id="vex-chart-wrap" style="display:none;">
+      <div style="font-size:0.78rem;color:#64748b;margin-bottom:0.25rem;">New backported fixes per day</div>
+      <svg id="vex-chart-svg" style="display:block;width:100%;" height="170" viewBox="0 0 900 170" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="results" id="vex-results"></div>
+    <div class="banners" id="vex-banners"></div>
   </div>
 </main>
 
@@ -1715,8 +1749,8 @@ tabBtns.forEach(btn => {
     tabBtns.forEach(b => b.classList.toggle('active', b === btn));
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === `tab-${tab}`));
     document.body.dataset.activeTab = tab;
-    const TAB_LABELS = { lag: 'Malware Detection', bulk: 'bulk check', scan: 'Dependency Scan' };
-    const HIDE_SUFFIX = new Set(['lag', 'scan']);
+    const TAB_LABELS = { lag: 'Malware Detection', bulk: 'bulk check', scan: 'Dependency Scan', vex: 'Backported Fixes' };
+    const HIDE_SUFFIX = new Set(['lag', 'scan', 'vex']);
     tabLabel.textContent = TAB_LABELS[tab] ?? tab;
     document.getElementById('tab-suffix').style.display = HIDE_SUFFIX.has(tab) ? 'none' : '';
   });
@@ -2286,6 +2320,7 @@ function mavenApplyFilters(rows) {
   const sf = state.maven.statFilter;
   if (sf && MAVEN_STAT_PRED[sf]) out = out.filter(MAVEN_STAT_PRED[sf]);
   if (!document.getElementById('maven-show-prerelease').checked) out = out.filter(r => !mavenIsPrerelease(r.version));
+  if (document.getElementById('maven-only-vex').checked) out = out.filter(r => r.vex && r.vex.length);
   if (!document.getElementById('maven-show-all').checked) out = out.slice(0, 50);
   return out;
 }
@@ -2351,7 +2386,7 @@ function mavenRenderTable(data) {
       <tbody>`;
 
   const showMalware = document.getElementById('maven-show-malware').checked;
-  const showVex = document.getElementById('maven-show-vex').checked;
+  const showVex = document.getElementById('maven-show-vex').checked || document.getElementById('maven-only-vex').checked;
   for (const row of rows) {
     const isLatest = row.version === latest;
     const mvnUrl = row.inMvn ? `https://search.maven.org/artifact/${encodeURIComponent(group)}/${encodeURIComponent(artifact)}/${encodeURIComponent(row.version)}/jar` : null;
@@ -2392,6 +2427,7 @@ document.getElementById('maven-show-all').addEventListener('change', () => { if 
 document.getElementById('maven-show-prerelease').addEventListener('change', () => { if (state.maven.lastData) mavenRenderTable(state.maven.lastData); });
 document.getElementById('maven-show-malware').addEventListener('change', () => { if (state.maven.lastData) mavenRenderTable(state.maven.lastData); });
 document.getElementById('maven-show-vex').addEventListener('change', () => { if (state.maven.lastData) mavenRenderTable(state.maven.lastData); });
+document.getElementById('maven-only-vex').addEventListener('change', () => { if (state.maven.lastData) mavenRenderTable(state.maven.lastData); });
 
 // Clicking a top-right stat box filters the table to those versions (toggle);
 // the ✕ chip clears it. Delegated so it survives table re-renders.
@@ -2784,6 +2820,7 @@ async function pypiLookup(pkg) {
 function pypiApplyFilters(rows) {
   let out = rows;
   if (!document.getElementById('pypi-show-prerelease').checked) out = out.filter(r => !pypiIsPrerelease(r.version));
+  if (document.getElementById('pypi-only-vex').checked) out = out.filter(r => r.vex && r.vex.length);
   if (!document.getElementById('pypi-show-all').checked) out = out.slice(0, 50);
   return out;
 }
@@ -2884,7 +2921,7 @@ function pypiRenderTable(data) {
       <tbody>`;
 
   const showMalware = document.getElementById('pypi-show-malware').checked;
-  const showVex = document.getElementById('pypi-show-vex').checked;
+  const showVex = document.getElementById('pypi-show-vex').checked || document.getElementById('pypi-only-vex').checked;
   for (const row of rows) {
     const isLatest = row.version === latest;
     html += `<tr${isLatest ? ' class="latest"' : ''}>`;
@@ -2927,6 +2964,7 @@ document.getElementById('pypi-show-all').addEventListener('change', () => { if (
 document.getElementById('pypi-show-prerelease').addEventListener('change', () => { if (state.pypi.lastData) pypiRenderTable(state.pypi.lastData); });
 document.getElementById('pypi-show-malware').addEventListener('change', () => { if (state.pypi.lastData) pypiRenderTable(state.pypi.lastData); });
 document.getElementById('pypi-show-vex').addEventListener('change', () => { if (state.pypi.lastData) pypiRenderTable(state.pypi.lastData); });
+document.getElementById('pypi-only-vex').addEventListener('change', () => { if (state.pypi.lastData) pypiRenderTable(state.pypi.lastData); });
 
 document.getElementById('pypi-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -4465,6 +4503,162 @@ document.getElementById('lag-table-exact').addEventListener('change', () => lagS
 document.getElementById('lag-table-prev').addEventListener('click', () => { if (lagTableState.page > 0) { lagTableState.page--; lagLoadTable(); } });
 document.getElementById('lag-table-next').addEventListener('click', () => { lagTableState.page++; lagLoadTable(); });
 
+
+// ── Backported Fixes (VEX) tab ────────────────────────────────────────────────
+const vexBrowseState = { page: 0, pageSize: 100, total: 0, eco: '' };
+let _vexTimer = null;
+let _vexStatusLoaded = false;
+
+const VEX_ECO_LABELS = { pypi: 'PyPI', maven: 'Maven' };
+
+function vexPkgLink(pkg, eco) {
+  if (eco === 'pypi') return `https://pypi.org/project/${encodeURIComponent(pkg)}/`;
+  if (eco === 'maven') { const [g, a] = pkg.split(':'); return `https://central.sonatype.com/artifact/${encodeURIComponent(g || pkg)}/${encodeURIComponent(a || '')}`; }
+  return '#';
+}
+function vexAdvisoryLink(id) {
+  if (/^CVE-/i.test(id)) return `https://nvd.nist.gov/vuln/detail/${encodeURIComponent(id)}`;
+  if (/^GHSA-/i.test(id)) return `https://github.com/advisories/${encodeURIComponent(id)}`;
+  return null;
+}
+
+async function vexLoadStatus() {
+  try {
+    const s = await fetch('/api/cgr-malware/status').then(r => r.json());
+    const v = s.vex || {};
+    document.getElementById('vex-total').textContent = (v.total || 0).toLocaleString();
+    document.getElementById('vex-last-sync').textContent = v.lastSyncAt ? formatDate(v.lastSyncAt) : 'never';
+  } catch { /* leave defaults */ }
+}
+
+async function vexLoadTable() {
+  const p = new URLSearchParams();
+  const q = document.getElementById('vex-search').value.trim();
+  if (q) p.set('q', q);
+  if (vexBrowseState.eco) p.set('eco', vexBrowseState.eco);
+  p.set('limit', vexBrowseState.pageSize);
+  p.set('offset', vexBrowseState.page * vexBrowseState.pageSize);
+
+  const res = await fetch(`/api/cgr-vex/browse?${p}`).then(r => r.json());
+  vexBrowseState.total = res.total;
+
+  document.getElementById('vex-count').textContent = res.total.toLocaleString();
+  const start = res.offset + 1, end = Math.min(res.offset + res.rows.length, res.total);
+  document.getElementById('vex-page-info').textContent = res.total === 0 ? '—' : `${start.toLocaleString()}–${end.toLocaleString()}`;
+  document.getElementById('vex-prev').disabled = vexBrowseState.page === 0;
+  document.getElementById('vex-next').disabled = end >= res.total;
+
+  const el = document.getElementById('vex-results');
+  if (res.rows.length === 0) {
+    el.innerHTML = '<div class="mal-empty">No backported fixes match this search.</div>';
+    return;
+  }
+
+  el.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>Fixed</th><th>Ecosystem</th><th>Package</th><th>Vulnerability</th><th>Fixed in (Chainguard build)</th></tr></thead>
+    <tbody>${res.rows.map(r => {
+      const primary = r.cve || r.ghsa || r.vuln || '—';
+      const link = vexAdvisoryLink(primary);
+      const vulnCell = link
+        ? `<a href="${escHtml(link)}" target="_blank" rel="noopener" style="font-family:monospace;font-size:0.8rem;">${escHtml(primary)}</a>`
+        : `<span style="font-family:monospace;font-size:0.8rem;">${escHtml(primary)}</span>`;
+      const otherIds = (r.aliases || []).filter(a => a !== primary);
+      const aliasTip = otherIds.length ? ` <span data-tip="${escHtml(otherIds.join(', '))}" style="color:#94a3b8;font-size:0.72rem;cursor:help;">ⓘ</span>` : '';
+      const versions = r.fullVersions.length ? r.fullVersions : r.baseVersions;
+      const vShown = versions.slice(0, 4).map(escHtml).join(', ');
+      const vMore = versions.length > 4 ? ` <span data-tip="${escHtml(versions.join(', '))}" style="color:#94a3b8;font-size:0.72rem;cursor:help;">+${versions.length - 4} more</span>` : '';
+      return `<tr>
+        <td style="font-size:0.78rem;white-space:nowrap;">${r.fixedAt ? escHtml(formatDate(r.fixedAt)) + ` <span data-tip="${escHtml(formatDateExact(r.fixedAt))}" style="color:#94a3b8;font-size:0.72rem;cursor:help;">ⓘ</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
+        <td style="font-size:0.78rem;">${escHtml(VEX_ECO_LABELS[r.ecosystem] || r.ecosystem)}</td>
+        <td><a href="${escHtml(vexPkgLink(r.package, r.ecosystem))}" target="_blank" rel="noopener" style="font-family:monospace;font-size:0.8rem;">${escHtml(r.package)}</a></td>
+        <td>${vulnCell}${aliasTip}</td>
+        <td style="font-family:monospace;font-size:0.76rem;">${vShown}${vMore}</td>
+      </tr>`;
+    }).join('')}
+    </tbody></table></div>`;
+}
+
+async function vexLoadChart() {
+  const p = new URLSearchParams();
+  const q = document.getElementById('vex-search').value.trim();
+  if (q) p.set('q', q);
+  if (vexBrowseState.eco) p.set('eco', vexBrowseState.eco);
+  const res = await fetch(`/api/cgr-vex/histogram?${p}`).then(r => r.json()).catch(() => ({ points: [] }));
+  vexRenderChart(res.points || []);
+}
+
+function vexRenderChart(points) {
+  const wrap = document.getElementById('vex-chart-wrap');
+  const svg = document.getElementById('vex-chart-svg');
+  if (!points.length) { wrap.style.display = 'none'; svg.innerHTML = ''; return; }
+  wrap.style.display = '';
+
+  // Fill calendar gaps so the time axis is continuous (0-count days show no bar).
+  const byDay = new Map(points.map(p => [p.day, p.n]));
+  const days = [];
+  const cur = new Date(points[0].day + 'T00:00:00Z');
+  const end = new Date(points[points.length - 1].day + 'T00:00:00Z');
+  while (cur <= end) {
+    const key = cur.toISOString().slice(0, 10);
+    days.push({ day: key, n: byDay.get(key) || 0 });
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+
+  const W = 900, H = 170, padL = 30, padR = 8, padT = 10, padB = 24;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const max = Math.max(...days.map(d => d.n), 1);
+  const bw = plotW / days.length;
+  const y = n => padT + plotH - (n / max) * plotH;
+
+  const fmtLabel = k => { const d = new Date(k + 'T00:00:00Z'); return dateFmt.format(d); };
+  const bars = days.map((d, i) => {
+    if (!d.n) return '';
+    const x = padL + i * bw;
+    const h = plotH - (y(d.n) - padT);
+    const bw2 = Math.max(1, bw - (bw > 4 ? 1 : 0.3));
+    return `<rect x="${x.toFixed(2)}" y="${y(d.n).toFixed(2)}" width="${bw2.toFixed(2)}" height="${h.toFixed(2)}" fill="#22c55e" data-tip="${escHtml(fmtLabel(d.day))}: ${d.n} fix${d.n === 1 ? '' : 'es'}"><title>${escHtml(fmtLabel(d.day))}: ${d.n}</title></rect>`;
+  }).join('');
+
+  // Gridlines + y labels at 0 and max; a few x-axis date ticks.
+  const yAxis = `
+    <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="#e2e8f0"/>
+    <line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="#e2e8f0"/>
+    <text x="${padL - 5}" y="${padT + 4}" text-anchor="end" font-size="9" fill="#94a3b8">${max}</text>
+    <text x="${padL - 5}" y="${padT + plotH}" text-anchor="end" font-size="9" fill="#94a3b8">0</text>`;
+  const ticks = [0, Math.floor(days.length / 2), days.length - 1].filter((v, i, a) => a.indexOf(v) === i && days[v]);
+  const xLabels = ticks.map(i => {
+    const x = Math.min(W - padR - 30, Math.max(padL, padL + i * bw));
+    return `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="${i === 0 ? 'start' : i === days.length - 1 ? 'end' : 'middle'}" font-size="9" fill="#94a3b8">${escHtml(fmtLabel(days[i].day))}</text>`;
+  }).join('');
+
+  svg.innerHTML = `${yAxis}${bars}${xLabels}`;
+}
+
+function vexScheduleTable(immediate = false) {
+  clearTimeout(_vexTimer);
+  _vexTimer = setTimeout(() => { vexBrowseState.page = 0; vexLoadChart(); vexLoadTable(); }, immediate ? 0 : 250);
+}
+
+document.getElementById('vex-search').addEventListener('input', () => vexScheduleTable());
+document.getElementById('vex-prev').addEventListener('click', () => { if (vexBrowseState.page > 0) { vexBrowseState.page--; vexLoadTable(); } });
+document.getElementById('vex-next').addEventListener('click', () => { vexBrowseState.page++; vexLoadTable(); });
+document.getElementById('vex-eco-chips').addEventListener('click', (e) => {
+  const btn = e.target.closest('.mal-source-chip');
+  if (!btn) return;
+  vexBrowseState.eco = btn.dataset.eco || '';
+  document.querySelectorAll('#vex-eco-chips .mal-source-chip').forEach(b => {
+    const on = b === btn;
+    b.classList.toggle('active', on);
+    b.style.background = on ? '#475569' : '';
+  });
+  vexScheduleTable(true);
+});
+
+// Load on first tab switch.
+document.querySelector('[data-tab="vex"]').addEventListener('click', () => {
+  if (!_vexStatusLoaded) { _vexStatusLoaded = true; vexLoadStatus(); }
+  if (!document.getElementById('vex-results').innerHTML) { vexLoadChart(); vexLoadTable(); }
+});
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
 {
