@@ -500,12 +500,15 @@ function malwareStatus() {
   `).get();
   const vexLastSync = db.prepare(`SELECT value FROM sync_meta WHERE key = 'vex_last_sync_at'`).get();
   const vexCounts = db.prepare(`SELECT ecosystem, COUNT(*) AS n, COUNT(DISTINCT package_name) AS pkgs FROM vex GROUP BY ecosystem`).all();
+  // `cves` = distinct CVE ids fixed (one CVE often spans many packages/builds);
   // `fixes` = distinct (package × vulnerability); `total` = raw rows (also spread
   // across build versions); `packages` = distinct packages with ≥1 backport.
+  const vexCves = db.prepare(`SELECT COUNT(DISTINCT cve) AS n FROM vex WHERE cve IS NOT NULL AND cve != ''`).get().n;
   const vexFixes = db.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM vex GROUP BY ecosystem, package_name, vuln_name)`).get().n;
   const vexPackages = db.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM vex GROUP BY ecosystem, package_name)`).get().n;
   const vex = {
     warm: vexWarm,
+    cves: vexCves,
     fixes: vexFixes,
     packages: vexPackages,
     total: vexCounts.reduce((s, r) => s + r.n, 0),
