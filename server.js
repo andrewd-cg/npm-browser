@@ -1,6 +1,7 @@
 // Run with: ~/.bun/bin/bun server.js
 import { createPublicKey, verify as cryptoVerify, X509Certificate } from 'crypto';
 import { Database } from 'bun:sqlite';
+import { unlink } from 'node:fs/promises';
 const htmlPath = new URL('./index.html', import.meta.url);
 
 // ── Malware cache (SQLite) ────────────────────────────────────────────────────
@@ -269,6 +270,7 @@ function refreshPlatformTokenViaChainctl() {
   if (tokenRefreshInFlight) return tokenRefreshInFlight;
   tokenRefreshInFlight = (async () => {
     try {
+      if (ON_GCP) await ensureChainctlLogin(); // establish an ambient session first
       const proc = Bun.spawn(['chainctl', 'auth', 'token', '--audience', 'https://console-api.enforce.dev'], {
         stdout: 'pipe', stderr: 'pipe',
       });
@@ -310,16 +312,8 @@ function scheduleTokenRefresh() {
   }, Math.max(60000, delay));
 }
 
-// Seed from env var on startup; if none set, try to mint via chainctl
-if (platformToken) {
-  platformTokenExpiry = parsePlatformTokenExpiry(platformToken);
-  if (platformTokenExpiry) scheduleTokenRefresh();
-} else {
-  refreshPlatformTokenViaChainctl().then(t => {
-    if (t) console.log('Platform token auto-minted via chainctl on startup');
-    else console.log('No platform token — paste one in Settings or mount chainctl config');
-  });
-}
+// (Startup platform-token seeding is relocated below, after the registry-auth
+// helpers, so it can use the GCP workload-identity login path without a TDZ.)
 
 // ── Chainguard Libraries registry auth (libraries.cgr.dev) ──────────────────
 // Unlike console-api, the registry doesn't want a pre-exchanged token: it takes
@@ -333,6 +327,14 @@ if (platformToken) {
 const CHAINGUARD_IDENTITY = process.env.CHAINGUARD_IDENTITY || '';
 const SA_TOKEN_PATH = process.env.SA_TOKEN_PATH || '/var/run/chainguard/oidc/oidc-token';
 const REGISTRY_AUDIENCE = 'libraries.cgr.dev';
+// Cloud Run (and other GCP compute) has no projected-token file; instead we pull
+// a Google-signed OIDC token from the instance metadata server. Detected via
+// K_SERVICE (always set by Cloud Run); override with CGR_AMBIENT=gcp elsewhere.
+const ON_GCP = !!process.env.K_SERVICE || (process.env.CGR_AMBIENT || '').toLowerCase() === 'gcp';
+const METADATA_ID_TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity';
+const WORKLOAD_OIDC_AUDIENCE = 'https://issuer.enforce.dev';
+let chainctlLoginAt = 0;          // last successful ambient login (ms)
+let chainctlLoginInFlight = null; // single-flight guard
 let registryToken = process.env.CGR_REGISTRY_TOKEN || null;
 let registryTokenExpiry = registryToken ? parsePlatformTokenExpiry(registryToken) : null;
 let registryHeaderCache = { header: null, refreshAt: 0 }; // Basic(UIDP:oidc), rebuilt every 60s
@@ -342,11 +344,72 @@ async function readProjectedToken() {
   catch { return null; }
 }
 
+// Google-signed OIDC token for the runtime service account (Cloud Run / GCE).
+// subject = the SA's numeric ID, which the assumable identity's claim_match
+// validates; aud = issuer.enforce.dev (what the registry STS and chainctl want).
+async function fetchGcpIdToken(audience = WORKLOAD_OIDC_AUDIENCE) {
+  try {
+    const res = await fetch(`${METADATA_ID_TOKEN_URL}?audience=${encodeURIComponent(audience)}&format=full`,
+      { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(2000) });
+    if (!res.ok) throw new Error(`metadata HTTP ${res.status}`);
+    return (await res.text()).trim();
+  } catch (err) {
+    console.warn('[cgr] GCP metadata token fetch failed:', err.message);
+    return null;
+  }
+}
+
+// The OIDC token used as the registry Basic password: the K8s projected token in
+// the lab, else the GCP metadata token on Cloud Run. The registry does the STS
+// exchange itself, so no chainctl needed for registry reads.
+async function getWorkloadOidcToken() {
+  const projected = await readProjectedToken();
+  if (projected) return projected;
+  if (ON_GCP) return await fetchGcpIdToken();
+  return null;
+}
+
+// console-api needs a *Chainguard* bearer token (an STS exchange), which chainctl
+// (bundled in the image) performs given the GCP metadata token + identity UIDP.
+// We log in once and re-login well before the ~1h expiry; afterwards the existing
+// `chainctl auth token` calls succeed. No-op off GCP (the lab uses the file path).
+async function ensureChainctlLogin() {
+  if (!ON_GCP || !CHAINGUARD_IDENTITY) return false;
+  if (Date.now() - chainctlLoginAt < 45 * 60 * 1000) return true;
+  if (chainctlLoginInFlight) return chainctlLoginInFlight;
+  chainctlLoginInFlight = (async () => {
+    const token = await fetchGcpIdToken();
+    if (!token) return false;
+    const tmp = `/tmp/cgr-oidc-${process.pid}`;
+    try {
+      await Bun.write(tmp, token);
+      const proc = Bun.spawn(['chainctl', 'auth', 'login', '--headless',
+        '--identity-token', tmp, '--identity', CHAINGUARD_IDENTITY,
+        '--audience', 'https://console-api.enforce.dev', '--audience', REGISTRY_AUDIENCE],
+        { stdout: 'pipe', stderr: 'pipe' });
+      const errText = await new Response(proc.stderr).text();
+      const code = await proc.exited;
+      if (code !== 0) throw new Error(`chainctl login exited ${code}: ${errText.trim().slice(0, 300) || '(no stderr)'}`);
+      chainctlLoginAt = Date.now();
+      console.log('[cgr] chainctl logged in via GCP workload identity');
+      return true;
+    } catch (err) {
+      console.error('[cgr] chainctl ambient login failed:', err.message);
+      return false;
+    } finally {
+      await unlink(tmp).catch(() => {});
+    }
+  })();
+  chainctlLoginInFlight.finally(() => { chainctlLoginInFlight = null; });
+  return chainctlLoginInFlight;
+}
+
 let registryRefreshInFlight = null;
 function refreshRegistryTokenViaChainctl() {
   if (registryRefreshInFlight) return registryRefreshInFlight;
   registryRefreshInFlight = (async () => {
     try {
+      if (ON_GCP) await ensureChainctlLogin(); // establish an ambient session first
       const proc = Bun.spawn(['chainctl', 'auth', 'token', '--audience', REGISTRY_AUDIENCE], { stdout: 'pipe', stderr: 'pipe' });
       const [text, errText] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
       const code = await proc.exited;
@@ -383,17 +446,31 @@ async function cgrHeaders(req) {
   if (CHAINGUARD_IDENTITY) {
     const now = Date.now();
     if (registryHeaderCache.header && now < registryHeaderCache.refreshAt) return { 'Authorization': registryHeaderCache.header };
-    const idToken = await readProjectedToken(); // kubelet rotates this file in place
+    const idToken = await getWorkloadOidcToken(); // K8s projected file, or GCP metadata on Cloud Run
     if (idToken) {
       const header = 'Basic ' + Buffer.from(`${CHAINGUARD_IDENTITY}:${idToken}`).toString('base64');
       registryHeaderCache = { header, refreshAt: now + 60000 };
       return { 'Authorization': header };
     }
-    console.warn(`[cgr] CHAINGUARD_IDENTITY set but no projected token at ${SA_TOKEN_PATH}`);
+    console.warn(`[cgr] CHAINGUARD_IDENTITY set but no workload OIDC token (no file at ${SA_TOKEN_PATH}${ON_GCP ? ', and GCP metadata fetch failed' : ''})`);
   }
 
   const token = await ensureRegistryTokenFresh();
   return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
+
+// Seed the platform token: from env, else mint via chainctl. On Cloud Run,
+// refreshPlatformTokenViaChainctl establishes the GCP workload-identity session
+// (ensureChainctlLogin) before minting. Relocated here so it runs after the
+// registry-auth helpers are initialized.
+if (platformToken) {
+  platformTokenExpiry = parsePlatformTokenExpiry(platformToken);
+  if (platformTokenExpiry) scheduleTokenRefresh();
+} else {
+  refreshPlatformTokenViaChainctl().then(t => {
+    if (t) console.log('Platform token auto-minted via chainctl on startup');
+    else console.log('No platform token — paste one in Settings or mount chainctl config');
+  });
 }
 
 // ── Malware sync ──────────────────────────────────────────────────────────────
