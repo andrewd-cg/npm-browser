@@ -1423,8 +1423,8 @@ Bun.serve({
       return new Response(JSON.stringify({ total, rows: out, limit, offset }), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // New backported fixes per day (same filter shape as /browse). One fix =
-    // one (package × vulnerability) on a given day.
+    // New backported fixes per month (same filter shape as /browse). One fix =
+    // one (package × vulnerability) in a given month.
     if (url.pathname === '/api/cgr-vex/histogram') {
       const eco = url.searchParams.get('eco') || '';
       const q   = url.searchParams.get('q')   || '';
@@ -1437,13 +1437,21 @@ Bun.serve({
       }
       const whereSql = `WHERE ${where.join(' AND ')}`;
       const rows = db.prepare(`
-        SELECT day, COUNT(*) AS n FROM (
-          SELECT substr(fixed_at, 1, 10) AS day
+        SELECT bucket, ecosystem, COUNT(*) AS n FROM (
+          SELECT substr(fixed_at, 1, 7) AS bucket, ecosystem
           FROM vex ${whereSql}
-          GROUP BY ecosystem, package_name, vuln_name, substr(fixed_at, 1, 10)
-        ) GROUP BY day ORDER BY day ASC
+          GROUP BY ecosystem, package_name, vuln_name, substr(fixed_at, 1, 7)
+        ) GROUP BY bucket, ecosystem ORDER BY bucket ASC
       `).all(...args);
-      return new Response(JSON.stringify({ points: rows }), { headers: { 'Content-Type': 'application/json' } });
+      // Pivot to one row per month with a per-ecosystem breakdown for stacking.
+      const byBucket = new Map();
+      for (const r of rows) {
+        let e = byBucket.get(r.bucket);
+        if (!e) { e = { bucket: r.bucket, pypi: 0, maven: 0 }; byBucket.set(r.bucket, e); }
+        if (r.ecosystem in e) e[r.ecosystem] = r.n;
+      }
+      const points = [...byBucket.values()];
+      return new Response(JSON.stringify({ points }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Malware cache status

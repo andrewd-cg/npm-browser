@@ -1156,8 +1156,12 @@
       <button type="button" class="copy-btn" id="vex-next" disabled>Next →</button>
     </div>
     <div class="vex-chart-wrap" id="vex-chart-wrap" style="display:none;">
-      <div style="font-size:0.78rem;color:#64748b;margin-bottom:0.25rem;">New backported fixes per day</div>
-      <svg id="vex-chart-svg" style="display:block;width:100%;" height="170" viewBox="0 0 900 170" preserveAspectRatio="none"></svg>
+      <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.25rem;">
+        <span style="font-size:0.78rem;color:#64748b;">New backported fixes per month</span>
+        <span style="flex:1"></span>
+        <span id="vex-chart-legend" style="display:flex;gap:0.75rem;font-size:0.72rem;color:#475569;"></span>
+      </div>
+      <svg id="vex-chart-svg" style="display:block;width:100%;" height="170"></svg>
     </div>
     <div class="results" id="vex-results"></div>
     <div class="banners" id="vex-banners"></div>
@@ -4587,48 +4591,75 @@ async function vexLoadChart() {
   vexRenderChart(res.points || []);
 }
 
+const vexMonthFmt = new Intl.DateTimeFormat('en-GB', { month: 'short', year: 'numeric' });
+function vexFmtMonth(bucket) { // 'YYYY-MM' → 'Aug 2026'
+  const [y, m] = bucket.split('-').map(Number);
+  return vexMonthFmt.format(new Date(Date.UTC(y, m - 1, 1)));
+}
+// One colour per ecosystem; stacked bottom-to-top in this order.
+const VEX_CHART_ECOS = [
+  { key: 'maven', label: 'Maven', color: '#3b82f6' },
+  { key: 'pypi',  label: 'PyPI',  color: '#22c55e' },
+];
+
 function vexRenderChart(points) {
   const wrap = document.getElementById('vex-chart-wrap');
   const svg = document.getElementById('vex-chart-svg');
-  if (!points.length) { wrap.style.display = 'none'; svg.innerHTML = ''; return; }
+  const legend = document.getElementById('vex-chart-legend');
+  if (!points.length) { wrap.style.display = 'none'; svg.innerHTML = ''; legend.innerHTML = ''; return; }
   wrap.style.display = '';
 
-  // Fill calendar gaps so the time axis is continuous (0-count days show no bar).
-  const byDay = new Map(points.map(p => [p.day, p.n]));
-  const days = [];
-  const cur = new Date(points[0].day + 'T00:00:00Z');
-  const end = new Date(points[points.length - 1].day + 'T00:00:00Z');
-  while (cur <= end) {
-    const key = cur.toISOString().slice(0, 10);
-    days.push({ day: key, n: byDay.get(key) || 0 });
-    cur.setUTCDate(cur.getUTCDate() + 1);
+  // Fill month gaps so the time axis is continuous (0-count months show no bar).
+  const byMonth = new Map(points.map(p => [p.bucket, p]));
+  const months = [];
+  let [y, m] = points[0].bucket.split('-').map(Number);
+  const [ey, em] = points[points.length - 1].bucket.split('-').map(Number);
+  while (y < ey || (y === ey && m <= em)) {
+    const key = `${y}-${String(m).padStart(2, '0')}`;
+    const p = byMonth.get(key);
+    months.push({ bucket: key, pypi: p?.pypi || 0, maven: p?.maven || 0 });
+    if (++m > 12) { m = 1; y++; }
   }
 
-  const W = 900, H = 170, padL = 30, padR = 8, padT = 10, padB = 24;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  const max = Math.max(...days.map(d => d.n), 1);
-  const bw = plotW / days.length;
-  const y = n => padT + plotH - (n / max) * plotH;
+  // Only legend/stack the ecosystems that actually have data (respects the chip filter).
+  const ecos = VEX_CHART_ECOS.filter(e => months.some(d => d[e.key] > 0));
+  legend.innerHTML = ecos.map(e => `<span style="display:inline-flex;align-items:center;gap:0.3rem;"><span style="width:10px;height:10px;border-radius:2px;background:${e.color};display:inline-block;"></span>${e.label}</span>`).join('');
 
-  const fmtLabel = k => { const d = new Date(k + 'T00:00:00Z'); return dateFmt.format(d); };
-  const bars = days.map((d, i) => {
-    if (!d.n) return '';
-    const x = padL + i * bw;
-    const h = plotH - (y(d.n) - padT);
-    const bw2 = Math.max(1, bw - (bw > 4 ? 1 : 0.3));
-    return `<rect x="${x.toFixed(2)}" y="${y(d.n).toFixed(2)}" width="${bw2.toFixed(2)}" height="${h.toFixed(2)}" fill="#22c55e" data-tip="${escHtml(fmtLabel(d.day))}: ${d.n} fix${d.n === 1 ? '' : 'es'}"><title>${escHtml(fmtLabel(d.day))}: ${d.n}</title></rect>`;
+  const H = 170, padL = 34, padR = 8, padT = 10, padB = 24;
+  const W = Math.max(320, Math.round(svg.clientWidth || wrap.clientWidth || 900));
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const max = Math.max(...months.map(d => d.pypi + d.maven), 1);
+  const bw = plotW / months.length;
+  const scale = n => (n / max) * plotH;
+  const labelEvery = Math.ceil(months.length / 12); // keep x labels legible
+
+  const bars = months.map((d, i) => {
+    const total = d.pypi + d.maven;
+    if (!total) return '';
+    const x = padL + i * bw + (bw - Math.max(1, bw * 0.7)) / 2;
+    const barW = Math.max(1, bw * 0.7);
+    let yTop = padT + plotH; // stack upward from the baseline
+    let segs = '';
+    for (const e of ecos) {
+      const v = d[e.key];
+      if (!v) continue;
+      const h = scale(v);
+      yTop -= h;
+      segs += `<rect x="${x.toFixed(2)}" y="${yTop.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" fill="${e.color}" data-tip="${escHtml(vexFmtMonth(d.bucket))} · ${e.label}: ${v} fix${v === 1 ? '' : 'es'}"><title>${escHtml(vexFmtMonth(d.bucket))} · ${e.label}: ${v}</title></rect>`;
+    }
+    return segs;
   }).join('');
 
-  // Gridlines + y labels at 0 and max; a few x-axis date ticks.
   const yAxis = `
     <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="#e2e8f0"/>
     <line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="#e2e8f0"/>
     <text x="${padL - 5}" y="${padT + 4}" text-anchor="end" font-size="9" fill="#94a3b8">${max}</text>
     <text x="${padL - 5}" y="${padT + plotH}" text-anchor="end" font-size="9" fill="#94a3b8">0</text>`;
-  const ticks = [0, Math.floor(days.length / 2), days.length - 1].filter((v, i, a) => a.indexOf(v) === i && days[v]);
-  const xLabels = ticks.map(i => {
-    const x = Math.min(W - padR - 30, Math.max(padL, padL + i * bw));
-    return `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="${i === 0 ? 'start' : i === days.length - 1 ? 'end' : 'middle'}" font-size="9" fill="#94a3b8">${escHtml(fmtLabel(days[i].day))}</text>`;
+  const xLabels = months.map((d, i) => {
+    if (i % labelEvery !== 0 && i !== months.length - 1) return '';
+    const x = padL + i * bw + bw / 2;
+    return `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle" font-size="9" fill="#94a3b8">${escHtml(vexFmtMonth(d.bucket))}</text>`;
   }).join('');
 
   svg.innerHTML = `${yAxis}${bars}${xLabels}`;
