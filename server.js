@@ -423,8 +423,14 @@ function malwareStatus() {
   `).get();
   const vexLastSync = db.prepare(`SELECT value FROM sync_meta WHERE key = 'vex_last_sync_at'`).get();
   const vexCounts = db.prepare(`SELECT ecosystem, COUNT(*) AS n, COUNT(DISTINCT package_name) AS pkgs FROM vex GROUP BY ecosystem`).all();
+  // `fixes` = distinct (package × vulnerability); `total` = raw rows (also spread
+  // across build versions); `packages` = distinct packages with ≥1 backport.
+  const vexFixes = db.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM vex GROUP BY ecosystem, package_name, vuln_name)`).get().n;
+  const vexPackages = db.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM vex GROUP BY ecosystem, package_name)`).get().n;
   const vex = {
     warm: vexWarm,
+    fixes: vexFixes,
+    packages: vexPackages,
     total: vexCounts.reduce((s, r) => s + r.n, 0),
     byEco: Object.fromEntries(vexCounts.map(r => [r.ecosystem, { statements: r.n, packages: r.pkgs }])),
     lastSyncAt: vexLastSync?.value || null,

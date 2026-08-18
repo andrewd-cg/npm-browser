@@ -1138,7 +1138,7 @@
   <!-- backported fixes (VEX) tab -->
   <div id="tab-vex" class="tab-pane">
     <div class="mal-bar">
-      <span><span class="mal-stat" id="vex-total">0</span> backported fixes · Last sync: <span class="mal-stat" id="vex-last-sync">never</span></span>
+      <span><span class="mal-stat" id="vex-total">0</span> backported fixes across <span class="mal-stat" id="vex-pkgs">0</span> packages · Last sync: <span class="mal-stat" id="vex-last-sync">never</span></span>
       <span style="flex:1"></span>
       <span style="font-size:0.82rem;color:#64748b;">Chainguard rebuilds upstream releases with security fixes backported. Source: <a href="https://libraries.cgr.dev/openvex/v1/all.json" target="_blank" rel="noopener" style="color:#3b82f6;">OpenVEX feed</a>.</span>
     </div>
@@ -4530,7 +4530,8 @@ async function vexLoadStatus() {
   try {
     const s = await fetch('/api/cgr-malware/status').then(r => r.json());
     const v = s.vex || {};
-    document.getElementById('vex-total').textContent = (v.total || 0).toLocaleString();
+    document.getElementById('vex-total').textContent = (v.fixes || 0).toLocaleString();
+    document.getElementById('vex-pkgs').textContent = (v.packages || 0).toLocaleString();
     document.getElementById('vex-last-sync').textContent = v.lastSyncAt ? formatDate(v.lastSyncAt) : 'never';
   } catch { /* leave defaults */ }
 }
