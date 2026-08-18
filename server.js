@@ -35,6 +35,25 @@ db.exec(`
   );
 `);
 
+// Chainguard Libraries VEX (OpenVEX) — backported-fix statements, one row per
+// (package build version, vulnerability). Refreshed daily alongside the malware
+// mirror; a cold lookup falls back to a live per-package fetch.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS vex (
+    ecosystem    TEXT NOT NULL,   -- 'pypi' | 'maven'
+    package_name TEXT NOT NULL,   -- pypi: normalized name; maven: group:artifact
+    base_version TEXT NOT NULL,   -- upstream version (cgr build suffix stripped)
+    full_version TEXT NOT NULL,   -- chainguard build version (from the purl)
+    vuln_name    TEXT,            -- advisory id (CGA-…)
+    cve          TEXT,
+    ghsa         TEXT,
+    aliases_json TEXT,
+    synced_at    TEXT NOT NULL,
+    PRIMARY KEY (ecosystem, package_name, full_version, vuln_name)
+  );
+  CREATE INDEX IF NOT EXISTS idx_vex_pkg ON vex(ecosystem, package_name);
+`);
+
 // Migration: add published_at column if not present
 {
   const hasPubCol = db.prepare(`SELECT 1 FROM pragma_table_info('malware') WHERE name='published_at'`).get();
@@ -396,7 +415,15 @@ function malwareStatus() {
       COUNT(CASE WHEN published_at IN ('NOT_FOUND','ERROR') THEN 1 END) AS unavailable
     FROM malware
   `).get();
-  return { total, byEco, lastSyncAt: lastSync?.value || null, sync: { ...syncState }, platformToken: tokenStatus, enrich: { ...enrichCounts, state: { ...enrichState } } };
+  const vexLastSync = db.prepare(`SELECT value FROM sync_meta WHERE key = 'vex_last_sync_at'`).get();
+  const vexCounts = db.prepare(`SELECT ecosystem, COUNT(*) AS n, COUNT(DISTINCT package_name) AS pkgs FROM vex GROUP BY ecosystem`).all();
+  const vex = {
+    warm: vexWarm,
+    total: vexCounts.reduce((s, r) => s + r.n, 0),
+    byEco: Object.fromEntries(vexCounts.map(r => [r.ecosystem, { statements: r.n, packages: r.pkgs }])),
+    lastSyncAt: vexLastSync?.value || null,
+  };
+  return { total, byEco, lastSyncAt: lastSync?.value || null, sync: { ...syncState }, platformToken: tokenStatus, enrich: { ...enrichCounts, state: { ...enrichState } }, vex };
 }
 
 const SCOPE_NORM = { 'MALWARE_SCOPE_VERSION': 'version', 'MALWARE_SCOPE_PACKAGE': 'package', 'MALWARE_SCOPE_UNKNOWN': '' };
@@ -864,6 +891,7 @@ function scheduleMalwareJobs() {
     console.log(`[scheduler] next full resync at ${next.toString()} (in ${Math.round(delay / 60000)} min)`);
     setTimeout(async () => {
       await triggerScheduledSync({ full: true });
+      await runVexSync(); // refresh the VEX mirror alongside the malware resync
       scheduleDailyFull();
     }, delay);
   };
@@ -873,6 +901,170 @@ scheduleMalwareJobs();
 
 const statsCache = new Map(); // key → { result, expiresAt }
 const STATS_TTL = 30000; // 30 seconds
+
+// ── Chainguard Libraries VEX (OpenVEX) feed ───────────────────────────────────
+// Public feed: an index (all.json) listing per-package OpenVEX docs. Each doc
+// carries `fixed` statements — a statement means Chainguard's build of that
+// version (the purl carries the +cgr.N / -N.cgr.N build) backports a fix for the
+// referenced vulnerability. Only pypi + maven are published today. Persisted to
+// the `vex` table, refreshed daily with the malware mirror; a lookup while the
+// table is cold falls back to a live per-package fetch (same as malware).
+const VEX_BASE = 'https://libraries.cgr.dev/openvex/v1';
+const VEX_INDEX_TTL_MS = 60 * 60 * 1000; // 1h — only used for the cold/live path
+let vexIndexCache = { ids: null, fetchedAt: 0 }; // Set<string> of entry ids
+let vexWarm = db.prepare(`SELECT COUNT(*) AS n FROM vex`).get().n > 0;
+let vexSyncRunning = false;
+
+async function vexIndex() {
+  const now = Date.now();
+  if (vexIndexCache.ids && now - vexIndexCache.fetchedAt < VEX_INDEX_TTL_MS) return vexIndexCache.ids;
+  const res = await fetch(`${VEX_BASE}/all.json`);
+  if (!res.ok) throw new Error(`index HTTP ${res.status}`);
+  const data = await res.json();
+  const ids = new Set((data.entries || []).map(e => e.id));
+  vexIndexCache = { ids, fetchedAt: now };
+  return ids;
+}
+
+async function fetchVexDoc(id) {
+  try {
+    const res = await fetch(`${VEX_BASE}/${id}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    console.warn(`[vex] ${id} fetch failed:`, err.message);
+    return null;
+  }
+}
+
+// Strip the Chainguard build suffix to recover the upstream base version.
+//   pypi:  3.13.5+cgr.1     → 3.13.5   (PEP 440 local segment)
+//   maven: 1.4.197-0.cgr.3  → 1.4.197  (-<epoch>.cgr.<n>)
+function vexBaseVersion(v) {
+  return v
+    .replace(/\+.*$/, '')            // pypi local segment
+    .replace(/-\d+\.cgr\.\d+$/i, '') // maven -<epoch>.cgr.<n>
+    .replace(/[-.]cgr\.\d+$/i, '');  // defensive: other cgr build forms
+}
+
+function vexIdFor(eco, pkg) {
+  if (eco === 'pypi') {
+    const norm = pkg.toLowerCase().replace(/[-_.]+/g, '-'); // PEP 503 normalization
+    return `pypi/${norm}.openvex.json`;
+  }
+  if (eco === 'maven') {
+    return `maven/${pkg.replace('/', ':')}.openvex.json`; // pkg = group:artifact
+  }
+  return null;
+}
+
+// id → package_name as stored in the DB. `pypi/aiohttp.openvex.json` → `aiohttp`;
+// `maven/com.h2database:h2.openvex.json` → `com.h2database:h2`.
+function vexPkgFromId(id) {
+  return id.slice(id.indexOf('/') + 1).replace(/\.openvex\.json$/, '');
+}
+
+// Parse one OpenVEX doc into [{ fullVersion, baseVersion, vuln }].
+function parseVexDoc(doc) {
+  const fixes = [];
+  for (const s of (doc.statements || [])) {
+    if (s.status !== 'fixed') continue;
+    const name = s.vulnerability?.name || null;
+    const all = [name, ...(s.vulnerability?.aliases || [])].filter(Boolean);
+    const vuln = {
+      name,
+      cve:  all.find(a => /^CVE-/i.test(a)) || null,
+      ghsa: all.find(a => /^GHSA-/i.test(a)) || null,
+      aliases: all,
+    };
+    for (const p of (s.products || [])) {
+      const purl = p.identifiers?.purl || '';
+      const at = purl.lastIndexOf('@');
+      if (at < 0) continue;
+      const fullVersion = decodeURIComponent(purl.slice(at + 1));
+      fixes.push({ fullVersion, baseVersion: vexBaseVersion(fullVersion), vuln });
+    }
+  }
+  return fixes;
+}
+
+function dbVexFixes(eco, normPkg) {
+  return db.prepare(`
+    SELECT base_version, full_version, vuln_name, cve, ghsa, aliases_json
+    FROM vex WHERE ecosystem = ? AND package_name = ?
+  `).all(eco, normPkg).map(r => ({
+    fullVersion: r.full_version,
+    baseVersion: r.base_version,
+    vuln: { name: r.vuln_name, cve: r.cve, ghsa: r.ghsa, aliases: JSON.parse(r.aliases_json || '[]') },
+  }));
+}
+
+async function liveVexFixes(id) {
+  const ids = await vexIndex();
+  if (!ids.has(id)) return [];
+  const doc = await fetchVexDoc(id);
+  return doc ? parseVexDoc(doc) : [];
+}
+
+// Backported-fix statements for one package. Warm → read the DB; cold → live
+// fetch so results are correct now, falling back to whatever's persisted.
+async function vexFixesFor(eco, pkg) {
+  const id = vexIdFor(eco, pkg);
+  if (!id) return [];
+  const normPkg = vexPkgFromId(id);
+  if (vexWarm) return dbVexFixes(eco, normPkg);
+  const live = await liveVexFixes(id).catch(() => null);
+  return live || dbVexFixes(eco, normPkg);
+}
+
+// Full rebuild of the `vex` table from the feed. Cheap (~200 tiny docs); fetched
+// with limited concurrency. Called on startup and in the daily resync.
+async function runVexSync() {
+  if (vexSyncRunning) return;
+  vexSyncRunning = true;
+  try {
+    vexIndexCache = { ids: null, fetchedAt: 0 }; // force a fresh index for the rebuild
+    const ids = await vexIndex();
+    const entries = [...ids].filter(id => id.startsWith('pypi/') || id.startsWith('maven/'));
+    const rows = [];
+    const CONC = 8;
+    for (let i = 0; i < entries.length; i += CONC) {
+      const batch = entries.slice(i, i + CONC);
+      const docs = await Promise.all(batch.map(fetchVexDoc));
+      batch.forEach((id, j) => {
+        if (!docs[j]) return;
+        const eco = id.slice(0, id.indexOf('/'));
+        const pkg = vexPkgFromId(id);
+        for (const f of parseVexDoc(docs[j])) rows.push({ eco, pkg, f });
+      });
+    }
+    const now = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare(`DELETE FROM vex`).run();
+      const ins = db.prepare(`
+        INSERT OR REPLACE INTO vex
+          (ecosystem, package_name, base_version, full_version, vuln_name, cve, ghsa, aliases_json, synced_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+      `);
+      for (const { eco, pkg, f } of rows) {
+        ins.run(eco, pkg, f.baseVersion, f.fullVersion, f.vuln.name, f.vuln.cve, f.vuln.ghsa, JSON.stringify(f.vuln.aliases || []), now);
+      }
+    })();
+    db.prepare(`INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('vex_last_sync_at', ?)`).run(now);
+    vexWarm = true;
+    console.log(`[vex] synced ${rows.length} fix statements across ${entries.length} packages`);
+  } catch (err) {
+    console.error('[vex] sync failed:', err.message);
+  } finally {
+    vexSyncRunning = false;
+  }
+}
+
+// Warm the VEX mirror on startup (cheap; no platform token needed). Gated on the
+// same flag as the malware auto-sync so both background refreshes disable together.
+if ((process.env.MALWARE_AUTOSYNC || '').toLowerCase() !== 'off') {
+  runVexSync().catch(err => console.error('[vex] startup sync failed:', err.message));
+}
 
 Bun.serve({
   port: Number(process.env.PORT) || 3000,
@@ -1165,6 +1357,15 @@ Bun.serve({
       } catch (err) {
         return new Response(JSON.stringify({ error: err.message }), { status: 502, headers: { 'Content-Type': 'application/json' } });
       }
+    }
+
+    // Chainguard Libraries VEX — backported-fix statements for one package.
+    if (url.pathname === '/api/cgr-vex') {
+      const eco = url.searchParams.get('eco') || '';
+      const pkg = url.searchParams.get('package') || '';
+      if (!pkg) return new Response(JSON.stringify({ fixes: [] }), { headers: { 'Content-Type': 'application/json' } });
+      const fixes = await vexFixesFor(eco, pkg);
+      return new Response(JSON.stringify({ eco, package: pkg, fixes }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Malware cache status
