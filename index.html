@@ -1640,7 +1640,10 @@ refreshPlatformTokenStatus();
 // confusion, and close the panel if it happened to be open.
 fetch('/api/config').then(r => r.json()).then(cfg => {
   if (cfg.selfManagedAuth) {
-    settingsBtn.style.display = 'none';
+    // visibility (not display) so the gear keeps its header slot — otherwise the
+    // space-between layout re-centers and the tab nav shifts right.
+    settingsBtn.style.visibility = 'hidden';
+    settingsBtn.setAttribute('aria-hidden', 'true');
     settingsPanel.classList.remove('open');
   }
 }).catch(() => {});
