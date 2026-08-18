@@ -115,6 +115,8 @@
   .vex-chart-wrap { background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:0.75rem 1rem; margin-bottom:0.75rem; }
   .vex-chart-wrap rect { transition: opacity 0.1s; }
   .vex-chart-wrap rect:hover { opacity: 0.7; }
+  .vex-chart-wrap rect.vex-hit { cursor: pointer; }
+  .vex-chart-wrap rect.vex-hit:hover { opacity: 1; fill: rgba(71,85,105,0.07); }
   .lag-chart-axis { font-size:12px; fill:#64748b; font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
   .lag-chart-count { font-size:11px; fill:#475569; font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; font-weight:600; }
   .lag-chart-bar { cursor:pointer; transition:opacity 0.1s; }
@@ -1157,7 +1159,8 @@
     </div>
     <div class="vex-chart-wrap" id="vex-chart-wrap" style="display:none;">
       <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.25rem;">
-        <span style="font-size:0.78rem;color:#64748b;">New backported fixes per month</span>
+        <span id="vex-chart-title" style="font-size:0.78rem;color:#64748b;">New backported fixes per month</span>
+        <button type="button" class="copy-btn" id="vex-chart-back" style="display:none;">← All months</button>
         <span style="flex:1"></span>
         <span id="vex-chart-legend" style="display:flex;gap:0.75rem;font-size:0.72rem;color:#475569;"></span>
       </div>
@@ -4522,7 +4525,10 @@ document.getElementById('lag-table-next').addEventListener('click', () => { lagT
 
 
 // ── Backported Fixes (VEX) tab ────────────────────────────────────────────────
-const vexBrowseState = { page: 0, pageSize: 100, total: 0, eco: '' };
+// `month` ('YYYY-MM') is set by clicking a bar in the monthly chart, which
+// switches the chart to daily bars; `day` ('YYYY-MM-DD') is a further click on
+// one of those days. Both narrow the table below.
+const vexBrowseState = { page: 0, pageSize: 100, total: 0, eco: '', month: '', day: '' };
 let _vexTimer = null;
 let _vexStatusLoaded = false;
 
@@ -4556,6 +4562,8 @@ async function vexLoadTable() {
   const q = document.getElementById('vex-search').value.trim();
   if (q) p.set('q', q);
   if (vexBrowseState.eco) p.set('eco', vexBrowseState.eco);
+  const bucket = vexBrowseState.day || vexBrowseState.month;
+  if (bucket) p.set('bucket', bucket);
   p.set('limit', vexBrowseState.pageSize);
   p.set('offset', vexBrowseState.page * vexBrowseState.pageSize);
 
@@ -4598,44 +4606,74 @@ async function vexLoadTable() {
     </tbody></table></div>`;
 }
 
+let _vexChart = { points: [], granularity: 'month' };
+
 async function vexLoadChart() {
   const p = new URLSearchParams();
   const q = document.getElementById('vex-search').value.trim();
   if (q) p.set('q', q);
   if (vexBrowseState.eco) p.set('eco', vexBrowseState.eco);
+  if (vexBrowseState.month) p.set('month', vexBrowseState.month);
   const res = await fetch(`/api/cgr-vex/histogram?${p}`).then(r => r.json()).catch(() => ({ points: [] }));
-  vexRenderChart(res.points || []);
+  _vexChart = { points: res.points || [], granularity: res.granularity === 'day' ? 'day' : 'month' };
+  vexRenderChart();
 }
 
 const vexMonthFmt = new Intl.DateTimeFormat('en-GB', { month: 'short', year: 'numeric' });
+const vexDayFmt = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 function vexFmtMonth(bucket) { // 'YYYY-MM' → 'Aug 2026'
   const [y, m] = bucket.split('-').map(Number);
   return vexMonthFmt.format(new Date(Date.UTC(y, m - 1, 1)));
 }
+function vexFmtDay(bucket) { // 'YYYY-MM-DD' → '12 Aug 2026'
+  const [y, m, d] = bucket.split('-').map(Number);
+  return vexDayFmt.format(new Date(Date.UTC(y, m - 1, d)));
+}
+function vexFmtBucket(bucket) { return bucket.length > 7 ? vexFmtDay(bucket) : vexFmtMonth(bucket); }
 // One colour per ecosystem; stacked bottom-to-top in this order.
 const VEX_CHART_ECOS = [
   { key: 'maven', label: 'Maven', color: '#3b82f6' },
   { key: 'pypi',  label: 'PyPI',  color: '#22c55e' },
 ];
 
-function vexRenderChart(points) {
+// Every day of a 'YYYY-MM' month, as 'YYYY-MM-DD' keys.
+function vexDaysOfMonth(month) {
+  const [y, m] = month.split('-').map(Number);
+  const n = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return Array.from({ length: n }, (_, i) => `${month}-${String(i + 1).padStart(2, '0')}`);
+}
+
+function vexRenderChart() {
+  const { points, granularity } = _vexChart;
+  const dayMode = granularity === 'day';
   const wrap = document.getElementById('vex-chart-wrap');
   const svg = document.getElementById('vex-chart-svg');
   const legend = document.getElementById('vex-chart-legend');
-  if (!points.length) { wrap.style.display = 'none'; svg.innerHTML = ''; legend.innerHTML = ''; return; }
+  const title = document.getElementById('vex-chart-title');
+  const back = document.getElementById('vex-chart-back');
+  back.style.display = dayMode || vexBrowseState.month ? '' : 'none';
+  title.textContent = dayMode
+    ? `New backported fixes per day · ${vexFmtMonth(vexBrowseState.month)}`
+    : 'New backported fixes per month (click a bar for a daily view)';
+  if (!points.length) { svg.innerHTML = ''; legend.innerHTML = ''; wrap.style.display = dayMode ? '' : 'none'; return; }
   wrap.style.display = '';
 
-  // Fill month gaps so the time axis is continuous (0-count months show no bar).
-  const byMonth = new Map(points.map(p => [p.bucket, p]));
-  const months = [];
-  let [y, m] = points[0].bucket.split('-').map(Number);
-  const [ey, em] = points[points.length - 1].bucket.split('-').map(Number);
-  while (y < ey || (y === ey && m <= em)) {
-    const key = `${y}-${String(m).padStart(2, '0')}`;
-    const p = byMonth.get(key);
-    months.push({ bucket: key, pypi: p?.pypi || 0, maven: p?.maven || 0 });
-    if (++m > 12) { m = 1; y++; }
-  }
+  // Fill bucket gaps so the time axis is continuous (0-count buckets show no bar).
+  const byBucket = new Map(points.map(p => [p.bucket, p]));
+  const keys = dayMode ? vexDaysOfMonth(vexBrowseState.month) : (() => {
+    const out = [];
+    let [y, m] = points[0].bucket.split('-').map(Number);
+    const [ey, em] = points[points.length - 1].bucket.split('-').map(Number);
+    while (y < ey || (y === ey && m <= em)) {
+      out.push(`${y}-${String(m).padStart(2, '0')}`);
+      if (++m > 12) { m = 1; y++; }
+    }
+    return out;
+  })();
+  const months = keys.map(key => {
+    const p = byBucket.get(key);
+    return { bucket: key, pypi: p?.pypi || 0, maven: p?.maven || 0 };
+  });
 
   // Only legend/stack the ecosystems that actually have data (respects the chip filter).
   const ecos = VEX_CHART_ECOS.filter(e => months.some(d => d[e.key] > 0));
@@ -4652,9 +4690,15 @@ function vexRenderChart(points) {
 
   const bars = months.map((d, i) => {
     const total = d.pypi + d.maven;
-    if (!total) return '';
     const x = padL + i * bw + (bw - Math.max(1, bw * 0.7)) / 2;
     const barW = Math.max(1, bw * 0.7);
+    const label = vexFmtBucket(d.bucket);
+    const breakdown = ecos.filter(e => d[e.key]).map(e => `${e.label} ${d[e.key]}`).join(', ');
+    const tip = `${label} · ${total} fix${total === 1 ? '' : 'es'}`
+      + (breakdown && ecos.length > 1 ? ` (${breakdown})` : '')
+      + (dayMode ? '' : ' · click for daily view');
+    // Full-height click target: a bar is clickable even where it's tiny or empty.
+    const hit = `<rect class="vex-hit" x="${(padL + i * bw).toFixed(2)}" y="${padT}" width="${bw.toFixed(2)}" height="${plotH}" fill="transparent" data-bucket="${escHtml(d.bucket)}" data-tip="${escHtml(tip)}"/>`;
     let yTop = padT + plotH; // stack upward from the baseline
     let segs = '';
     for (const e of ecos) {
@@ -4662,9 +4706,12 @@ function vexRenderChart(points) {
       if (!v) continue;
       const h = scale(v);
       yTop -= h;
-      segs += `<rect x="${x.toFixed(2)}" y="${yTop.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" fill="${e.color}" data-tip="${escHtml(vexFmtMonth(d.bucket))} · ${e.label}: ${v} fix${v === 1 ? '' : 'es'}"><title>${escHtml(vexFmtMonth(d.bucket))} · ${e.label}: ${v}</title></rect>`;
+      segs += `<rect x="${x.toFixed(2)}" y="${yTop.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" fill="${e.color}" pointer-events="none"><title>${escHtml(label)} · ${e.label}: ${v}</title></rect>`;
     }
-    return segs;
+    const active = dayMode && d.bucket === vexBrowseState.day && total
+      ? `<rect x="${(x - 2).toFixed(2)}" y="${(yTop - 2).toFixed(2)}" width="${(barW + 4).toFixed(2)}" height="${(padT + plotH - yTop + 4).toFixed(2)}" fill="none" stroke="#1e293b" stroke-width="1.5" rx="2" pointer-events="none"/>`
+      : '';
+    return hit + segs + active;
   }).join('');
 
   const yAxis = `
@@ -4675,17 +4722,47 @@ function vexRenderChart(points) {
   const xLabels = months.map((d, i) => {
     if (i % labelEvery !== 0 && i !== months.length - 1) return '';
     const x = padL + i * bw + bw / 2;
-    return `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle" font-size="9" fill="#94a3b8">${escHtml(vexFmtMonth(d.bucket))}</text>`;
+    const text = dayMode ? String(Number(d.bucket.slice(8))) : vexFmtMonth(d.bucket);
+    return `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle" font-size="9" fill="#94a3b8">${escHtml(text)}</text>`;
   }).join('');
 
   svg.innerHTML = `${yAxis}${bars}${xLabels}`;
+  for (const el of svg.querySelectorAll('.vex-hit')) {
+    el.addEventListener('click', () => vexPickBucket(el.dataset.bucket));
+  }
 }
 
+// A click on a monthly bar drills into that month; a click on a daily bar
+// filters the table to that day (clicking it again clears the day).
+function vexPickBucket(bucket) {
+  vexBrowseState.page = 0;
+  if (_vexChart.granularity === 'day') {
+    vexBrowseState.day = vexBrowseState.day === bucket ? '' : bucket;
+    vexRenderChart();
+    vexLoadTable();
+  } else {
+    vexBrowseState.month = bucket;
+    vexBrowseState.day = '';
+    vexLoadChart();
+    vexLoadTable();
+  }
+}
+
+// Changing a filter drops any month/day drill-down — the chart goes back to the
+// full monthly view so the new filter's whole timeline is visible.
 function vexScheduleTable(immediate = false) {
   clearTimeout(_vexTimer);
-  _vexTimer = setTimeout(() => { vexBrowseState.page = 0; vexLoadChart(); vexLoadTable(); }, immediate ? 0 : 250);
+  _vexTimer = setTimeout(() => {
+    vexBrowseState.page = 0;
+    vexBrowseState.month = ''; vexBrowseState.day = '';
+    vexLoadChart(); vexLoadTable();
+  }, immediate ? 0 : 250);
 }
 
+document.getElementById('vex-chart-back').addEventListener('click', () => {
+  vexBrowseState.month = ''; vexBrowseState.day = ''; vexBrowseState.page = 0;
+  vexLoadChart(); vexLoadTable();
+});
 document.getElementById('vex-search').addEventListener('input', () => vexScheduleTable());
 document.getElementById('vex-prev').addEventListener('click', () => { if (vexBrowseState.page > 0) { vexBrowseState.page--; vexLoadTable(); } });
 document.getElementById('vex-next').addEventListener('click', () => { vexBrowseState.page++; vexLoadTable(); });

@@ -1467,11 +1467,15 @@ Bun.serve({
     if (url.pathname === '/api/cgr-vex/browse') {
       const eco    = url.searchParams.get('eco') || '';
       const q      = url.searchParams.get('q')   || '';
+      // `bucket` narrows to one month ('YYYY-MM') or one day ('YYYY-MM-DD'),
+      // matching a histogram drill-down.
+      const bucket = url.searchParams.get('bucket') || '';
       const limit  = Math.min(parseInt(url.searchParams.get('limit')  || '100', 10) || 100, 500);
       const offset = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
 
       const where = [], args = [];
       if (eco) { where.push('ecosystem = ?'); args.push(eco); }
+      if (/^\d{4}-\d{2}(-\d{2})?$/.test(bucket)) { where.push('substr(fixed_at, 1, ?) = ?'); args.push(bucket.length, bucket); }
       if (q) {
         where.push('(package_name LIKE ? OR cve LIKE ? OR ghsa LIKE ? OR vuln_name LIKE ? OR aliases_json LIKE ?)');
         const like = `%${q}%`;
@@ -1510,23 +1514,28 @@ Bun.serve({
     }
 
     // New backported fixes per month (same filter shape as /browse). One fix =
-    // one (package × vulnerability) in a given month.
+    // one (package × vulnerability) in a given bucket. Pass `month=YYYY-MM` to
+    // drill into that month, which switches the buckets to days.
     if (url.pathname === '/api/cgr-vex/histogram') {
       const eco = url.searchParams.get('eco') || '';
       const q   = url.searchParams.get('q')   || '';
+      const month = url.searchParams.get('month') || '';
+      const byDay = /^\d{4}-\d{2}$/.test(month);
       const where = ['fixed_at IS NOT NULL'], args = [];
       if (eco) { where.push('ecosystem = ?'); args.push(eco); }
+      if (byDay) { where.push('substr(fixed_at, 1, 7) = ?'); args.push(month); }
       if (q) {
         where.push('(package_name LIKE ? OR cve LIKE ? OR ghsa LIKE ? OR vuln_name LIKE ? OR aliases_json LIKE ?)');
         const like = `%${q}%`;
         args.push(like, like, like, like, like);
       }
       const whereSql = `WHERE ${where.join(' AND ')}`;
+      const bucketExpr = byDay ? 'substr(fixed_at, 1, 10)' : 'substr(fixed_at, 1, 7)';
       const rows = db.prepare(`
         SELECT bucket, ecosystem, COUNT(*) AS n FROM (
-          SELECT substr(fixed_at, 1, 7) AS bucket, ecosystem
+          SELECT ${bucketExpr} AS bucket, ecosystem
           FROM vex ${whereSql}
-          GROUP BY ecosystem, package_name, vuln_name, substr(fixed_at, 1, 7)
+          GROUP BY ecosystem, package_name, vuln_name, ${bucketExpr}
         ) GROUP BY bucket, ecosystem ORDER BY bucket ASC
       `).all(...args);
       // Pivot to one row per month with a per-ecosystem breakdown for stacking.
@@ -1537,7 +1546,7 @@ Bun.serve({
         if (r.ecosystem in e) e[r.ecosystem] = r.n;
       }
       const points = [...byBucket.values()];
-      return new Response(JSON.stringify({ points }), { headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ points, granularity: byDay ? 'day' : 'month', month: byDay ? month : null }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Lightweight client config. `selfManagedAuth` is true when the server runs
