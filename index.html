@@ -1186,6 +1186,16 @@ function formatDate(ts) {
   return `${dateFmt.format(d)} (${days}d ago)`;
 }
 
+// UTC calendar date. Use this wherever a date sits next to a UTC-bucketed chart,
+// so a late-in-the-day UTC timestamp doesn't read as the next day locally.
+const dateFmtUTC = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+function formatDateUTC(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  const days = Math.floor((Date.now() - d) / 86400000);
+  return `${dateFmtUTC.format(d)} (${days}d ago)`;
+}
+
 function formatDateExact(ts) {
   const d = new Date(typeof ts === 'number' ? ts : ts);
   if (isNaN(d)) return '';
@@ -4553,7 +4563,7 @@ async function vexLoadStatus() {
     cves.textContent = (v.cves || 0).toLocaleString();
     cves.title = `${(v.fixes || 0).toLocaleString()} package × vulnerability fixes in total`;
     document.getElementById('vex-pkgs').textContent = (v.packages || 0).toLocaleString();
-    document.getElementById('vex-last-sync').textContent = v.lastSyncAt ? formatDate(v.lastSyncAt) : 'never';
+    document.getElementById('vex-last-sync').textContent = v.lastSyncAt ? formatDateUTC(v.lastSyncAt) : 'never';
   } catch { /* leave defaults */ }
 }
 
@@ -4583,7 +4593,7 @@ async function vexLoadTable() {
   }
 
   el.innerHTML = `<div class="table-wrap"><table>
-    <thead><tr><th>Fixed</th><th>Ecosystem</th><th>Package</th><th>Vulnerability</th><th>Fixed in (Chainguard build)</th></tr></thead>
+    <thead><tr><th>Fixed (UTC)</th><th>Ecosystem</th><th>Package</th><th>Vulnerability</th><th>Fixed in (Chainguard build)</th></tr></thead>
     <tbody>${res.rows.map(r => {
       const primary = r.cve || r.ghsa || r.vuln || '—';
       const link = vexAdvisoryLink(primary);
@@ -4596,7 +4606,7 @@ async function vexLoadTable() {
       const vShown = versions.slice(0, 4).map(escHtml).join(', ');
       const vMore = versions.length > 4 ? ` <span data-tip="${escHtml(versions.join(', '))}" style="color:#94a3b8;font-size:0.72rem;cursor:help;">+${versions.length - 4} more</span>` : '';
       return `<tr>
-        <td style="font-size:0.78rem;white-space:nowrap;">${r.fixedAt ? escHtml(formatDate(r.fixedAt)) + ` <span data-tip="${escHtml(formatDateExact(r.fixedAt))}" style="color:#94a3b8;font-size:0.72rem;cursor:help;">ⓘ</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
+        <td style="font-size:0.78rem;white-space:nowrap;">${r.fixedAt ? escHtml(formatDateUTC(r.fixedAt)) + ` <span data-tip="${escHtml(formatDateExact(r.fixedAt))}" style="color:#94a3b8;font-size:0.72rem;cursor:help;">ⓘ</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
         <td style="font-size:0.78rem;">${escHtml(VEX_ECO_LABELS[r.ecosystem] || r.ecosystem)}</td>
         <td><a href="${escHtml(vexPkgLink(r.package, r.ecosystem))}" target="_blank" rel="noopener" style="font-family:monospace;font-size:0.8rem;">${escHtml(r.package)}</a></td>
         <td>${vulnCell}${aliasTip}</td>
@@ -4619,8 +4629,10 @@ async function vexLoadChart() {
   vexRenderChart();
 }
 
-const vexMonthFmt = new Intl.DateTimeFormat('en-GB', { month: 'short', year: 'numeric' });
-const vexDayFmt = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+// Buckets come from the UTC timestamp, so format their UTC-midnight dates in UTC
+// too — otherwise a viewer behind UTC sees every label shifted back a day.
+const vexMonthFmt = new Intl.DateTimeFormat('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+const vexDayFmt = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
 function vexFmtMonth(bucket) { // 'YYYY-MM' → 'Aug 2026'
   const [y, m] = bucket.split('-').map(Number);
   return vexMonthFmt.format(new Date(Date.UTC(y, m - 1, 1)));
