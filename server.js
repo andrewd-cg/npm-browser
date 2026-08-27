@@ -677,7 +677,7 @@ async function authoritativeCooldown(eco, pkg) {
 }
 
 // Identity key matching the malware PRIMARY KEY (normalised the same way insertItems stores).
-const malKey = (pkg, ver, malid, blockedAt) => `${pkg} ${ver ?? ''} ${malid ?? ''} ${blockedAt}`;
+const malKey = (pkg, ver, malid, blockedAt) => `${pkg}\u0000${ver ?? ''}\u0000${malid ?? ''}\u0000${blockedAt}`;
 
 // GET one blocklist page with 401→chainctl-refresh and transient-5xx/429 retry. Returns parsed JSON.
 async function malwareApiGet(params, ctx = '') {
@@ -806,7 +806,7 @@ async function reconcileMalwareRemovals(apiName, dbName) {
 // Best-effort: throws on API failure so the caller can fall back to local rows.
 // A short per-(eco,pkg) TTL avoids hammering the API on repeat views.
 const PKG_RECONCILE_TTL = 5 * 60 * 1000;
-const pkgReconciledAt = new Map(); // `${ecoDbName} ${pkg}` → last-reconciled epoch ms
+const pkgReconciledAt = new Map(); // `${ecoDbName}\u0000${pkg}` → last-reconciled epoch ms
 
 // Fetch every upstream blocklist entry for one package (paginated).
 async function fetchPackageBlocklist(apiName, pkg) {
@@ -846,7 +846,7 @@ async function reconcilePackage(ecoDbName, apiName, pkg) {
   // Skip when unauthenticated (avoid a chainctl mint storm on the read path) or
   // mid-sync (the running sync is already rewriting this ecosystem).
   if (!platformToken || !pkg || syncState.running) return;
-  const cacheKey = `${ecoDbName} ${pkg}`;
+  const cacheKey = `${ecoDbName}\u0000${pkg}`;
   const last = pkgReconciledAt.get(cacheKey);
   if (last && Date.now() - last < PKG_RECONCILE_TTL) return;
 
