@@ -101,8 +101,7 @@
   }
   .mal-chart-tick { stroke: #e2e8f0; stroke-width: 1; }
   .mal-lag-slider { accent-color: var(--accent); width: 160px; cursor: pointer; vertical-align: middle; }
-  .tip { cursor:default; }
-  #tip-box { position:fixed; background:#1e293b; color:#fff; font-size:0.72rem; line-height:1.5; padding:6px 10px; border-radius:5px; white-space:normal; width:260px; word-break:break-word; pointer-events:none; z-index:9999; display:none; }
+  .tip { cursor:help; }
 
   /* Time to Detection tab */
   .lag-stat-grid { display:flex; gap:0; flex-wrap:wrap; margin-bottom:1rem; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden; }
@@ -4851,32 +4850,9 @@ document.querySelector('[data-tab="vex"]').addEventListener('click', () => {
   if (!document.getElementById('vex-results').innerHTML) { vexLoadChart(); vexLoadTable(); }
 });
 
-// ── Tooltip ───────────────────────────────────────────────────────────────────
-{
-  // #tip-box is declared after this script, so look it up lazily and guard for null.
-  const getBox = () => document.getElementById('tip-box');
-  document.addEventListener('mouseover', e => {
-    const el = e.target.closest('.tip');
-    if (!el) return;
-    const box = getBox();
-    if (!box) return;
-    box.textContent = el.dataset.tip || '';
-    box.style.display = 'block';
-  });
-  document.addEventListener('mouseout', e => {
-    if (!e.target.closest('.tip')) return;
-    const box = getBox();
-    if (box) box.style.display = 'none';
-  });
-  document.addEventListener('mousemove', e => {
-    const box = getBox();
-    if (!box || box.style.display === 'none') return;
-    const x = e.clientX + 12, y = e.clientY + 12;
-    const vw = window.innerWidth, vh = window.innerHeight;
-    box.style.left = (x + 260 > vw ? vw - 268 : x) + 'px';
-    box.style.top  = (y + box.offsetHeight > vh ? e.clientY - box.offsetHeight - 8 : y) + 'px';
-  });
-}
+// Tooltips are handled by the single shared [data-tip] listener near the top of
+// this script. A second .tip-only tooltip used to live here and double-fired on
+// the lag table's ⓘ spans, which carry both `class="tip"` and `data-tip`.
 
 // Load on tab switch
 document.querySelector('[data-tab="lag"]').addEventListener('click', () => {
@@ -4885,6 +4861,5 @@ document.querySelector('[data-tab="lag"]').addEventListener('click', () => {
   else if (!document.getElementById('lag-table-results').innerHTML) lagLoadTable();
 });
 </script>
-<div id="tip-box"></div>
 </body>
 </html>
