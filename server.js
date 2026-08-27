@@ -676,6 +676,10 @@ async function authoritativeCooldown(eco, pkg) {
   return map;
 }
 
+// Distinct-source facet cache (see /api/cgr-malware/sources).
+const SOURCES_TTL = 60 * 1000;
+let sourcesCache = { at: 0, rows: null };
+
 // Identity key matching the malware PRIMARY KEY (normalised the same way insertItems stores).
 const malKey = (pkg, ver, malid, blockedAt) => `${pkg}\u0000${ver ?? ''}\u0000${malid ?? ''}\u0000${blockedAt}`;
 
@@ -1916,6 +1920,25 @@ Bun.serve({
         if (r.reason === 'MAL-ID*') r.searchAs = 'MAL-';
       }
       return new Response(JSON.stringify(rows), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Distinct sources (for filter facets), commonest first. Source ids come
+    // straight from upstream and their casing is inconsistent ('Datadog' vs
+    // 'chainguard'), so they're returned verbatim — the search endpoint matches
+    // them case-sensitively. Memoised: this is a full scan of the malware table.
+    if (url.pathname === '/api/cgr-malware/sources') {
+      if (!sourcesCache.rows || Date.now() - sourcesCache.at > SOURCES_TTL) {
+        sourcesCache = {
+          at: Date.now(),
+          rows: db.prepare(`
+            SELECT source, COUNT(*) AS n FROM malware
+            WHERE source IS NOT NULL AND source <> ''
+            GROUP BY source
+            ORDER BY n DESC, source COLLATE NOCASE
+          `).all(),
+        };
+      }
+      return new Response(JSON.stringify(sourcesCache.rows), { headers: { 'Content-Type': 'application/json' } });
     }
 
     return new Response('Not found', { status: 404 });

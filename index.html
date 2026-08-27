@@ -1046,11 +1046,9 @@
         <button class="mal-source-chip" data-eco="Maven">Maven</button>
       </div>
       <div class="mal-source-chips" style="margin-bottom:0;" id="lag-source-chips">
+        <!-- "All sources" is fixed; the per-source chips are rendered from
+             /api/cgr-malware/sources so a new upstream source can't go unfilterable. -->
         <button class="mal-source-chip active" data-source="" style="background:#475569;">All sources</button>
-        <button class="mal-source-chip" data-source="chainguard" data-color="#3b82f6">● Sentinel</button>
-        <button class="mal-source-chip" data-source="osv" data-color="#f59e0b">● OSV</button>
-        <button class="mal-source-chip" data-source="manual" data-color="#94a3b8">● Manual</button>
-        <button class="mal-source-chip" data-source="ossf-commits" data-color="#a855f7">● OSSF</button>
       </div>
       <span style="flex:1"></span>
       <span style="font-size:0.78rem;color:#64748b;">Blocked</span>
@@ -3996,6 +3994,50 @@ const SOURCE_COLORS = {
   unknown:    '#cbd5e1',
 };
 
+// Sources arrive from upstream and new ones appear without warning, so anything
+// not in SOURCE_COLORS gets a stable colour off this spare palette rather than
+// falling back to grey (which would collide with 'manual'). Assignment is by
+// first-seen order and memoised, so a source keeps its colour across re-renders.
+const SPARE_SOURCE_COLORS = ['#14b8a6', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#06b6d4'];
+const _assignedSrcColors = new Map();
+function srcColor(src) {
+  if (SOURCE_COLORS[src]) return SOURCE_COLORS[src];
+  if (!src) return SOURCE_COLORS.unknown;
+  if (!_assignedSrcColors.has(src)) {
+    _assignedSrcColors.set(src, SPARE_SOURCE_COLORS[_assignedSrcColors.size % SPARE_SOURCE_COLORS.length]);
+  }
+  return _assignedSrcColors.get(src);
+}
+
+// Build the source filter chips from the data. Source ids are case-sensitive on
+// the server, so data-source carries the id verbatim.
+let _lagSourceChipsLoaded = false;
+async function lagLoadSourceChips() {
+  if (_lagSourceChipsLoaded) return;
+  const box = document.getElementById('lag-source-chips');
+  let rows;
+  try {
+    rows = await fetch('/api/cgr-malware/sources').then(r => r.json());
+  } catch { return; } // leave "All sources" in place; retry on next tab visit
+  if (!Array.isArray(rows)) return;
+  _lagSourceChipsLoaded = true;
+  for (const { source, n } of rows) {
+    const color = srcColor(source);
+    const b = document.createElement('button');
+    b.className = 'mal-source-chip';
+    b.dataset.source = source;
+    b.dataset.color = color;
+    b.title = `${n.toLocaleString()} blocked`;
+    b.textContent = `● ${srcLabel(source)}`;
+    if (source === _lagSource) {
+      b.classList.add('active');
+      b.style.background = color;
+      b.style.borderColor = color;
+    }
+    box.appendChild(b);
+  }
+}
+
 
 function fmtEta(s) {
   if (s < 60)   return `~${Math.round(s)}s`;
@@ -4217,7 +4259,7 @@ function lagRenderHistogram(histogram, activeBucket) {
     let yTop = baseY - barH;
     const segs = sources.map(([src, n]) => {
       const segH = Math.max(1, Math.round(n / entry.n * barH));
-      const color = SOURCE_COLORS[src] || '#cbd5e1';
+      const color = srcColor(src);
       const seg = `<rect x="${x}" y="${yTop}" width="${barW}" height="${segH}" fill="${escHtml(color)}" opacity="${isActive ? '1' : '0.82'}"><title>${escHtml(srcLabel(src))}: ${n.toLocaleString()}</title></rect>`;
       yTop += segH;
       return seg;
@@ -4256,7 +4298,7 @@ function lagRenderHistogram(histogram, activeBucket) {
   // legend
   const activeSources = [...new Set(histogram.flatMap(b => Object.keys(b.bySource || {})))];
   document.getElementById('lag-legend').innerHTML = activeSources
-    .map(src => `<div class="lag-legend-item"><div class="lag-legend-dot" style="background:${escHtml(SOURCE_COLORS[src]||'#cbd5e1')}"></div>${escHtml(srcLabel(src))}</div>`)
+    .map(src => `<div class="lag-legend-item"><div class="lag-legend-dot" style="background:${escHtml(srcColor(src))}"></div>${escHtml(srcLabel(src))}</div>`)
     .join('');
 }
 
@@ -4337,11 +4379,11 @@ async function lagLoadDrillDown() {
 
   const tbody = res.rows.map(r => {
     const lag = malCalcLag(r.published_at, r.blocked_at);
-    const srcColor = SOURCE_COLORS[r.source] || '#94a3b8';
+    const rowSrcColor = srcColor(r.source);
     return `<tr>
       <td><a href="${escHtml(pkgLink(r.package_name,r.ecosystem))}" target="_blank" rel="noopener" style="font-family:monospace;font-size:0.8rem;">${escHtml(r.package_name)}</a></td>
       <td style="font-size:0.8rem;">${escHtml(r.version||'—')}</td>
-      <td style="font-size:0.75rem;"><span style="color:${escHtml(srcColor)};font-weight:600;">●</span> ${escHtml(r.ecosystem)}</td>
+      <td style="font-size:0.75rem;"><span style="color:${escHtml(rowSrcColor)};font-weight:600;">●</span> ${escHtml(r.ecosystem)}</td>
       <td style="font-size:0.78rem;white-space:nowrap;" title="${r.source||''}">${escHtml(srcLabel(r.source))}</td>
       <td style="font-size:0.78rem;white-space:nowrap;" title="${r.published_at||''}">${r.published_at ? escHtml(malFmtDate(r.published_at)) : '—'}</td>
       <td style="font-size:0.78rem;white-space:nowrap;" title="${r.blocked_at}">${escHtml(malFmtDate(r.blocked_at))}</td>
@@ -4507,13 +4549,13 @@ async function lagLoadTable() {
     <thead><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th><th>Published</th><th>Blocked at</th><th>TTD</th></tr></thead>
     <tbody>${res.rows.map(r => {
       const lag = malCalcLag(r.published_at, r.blocked_at);
-      const srcColor = SOURCE_COLORS[r.source] || '#94a3b8';
+      const rowSrcColor = srcColor(r.source);
       return `<tr>
         <td><a href="${escHtml(pkgLink(r.package_name, r.ecosystem))}" target="_blank" rel="noopener" style="font-family:monospace;font-size:0.8rem;">${escHtml(r.package_name)}</a></td>
         <td style="font-size:0.8rem;">${escHtml(r.version||'—')}</td>
         <td style="font-size:0.78rem;">${escHtml(r.ecosystem)}</td>
         <td style="font-size:0.78rem;">
-          <span style="color:${escHtml(srcColor)};font-weight:600;">●</span> ${escHtml(srcLabel(r.source))}${r.reason?.length ? ` <span class="tip" data-tip="${escHtml(r.reason.join(', '))}" style="color:#94a3b8;font-size:0.72rem;">ⓘ</span>` : ''}
+          <span style="color:${escHtml(rowSrcColor)};font-weight:600;">●</span> ${escHtml(srcLabel(r.source))}${r.reason?.length ? ` <span class="tip" data-tip="${escHtml(r.reason.join(', '))}" style="color:#94a3b8;font-size:0.72rem;">ⓘ</span>` : ''}
         </td>
         <td style="font-size:0.78rem;white-space:nowrap;">${r.published_at ? escHtml(malFmtDate(r.published_at)) + ` <span class="tip" data-tip="${escHtml(formatDateExact(r.published_at))}" style="color:#94a3b8;font-size:0.72rem;">ⓘ</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
         <td style="font-size:0.78rem;white-space:nowrap;">${escHtml(malFmtDate(r.blocked_at))} <span class="tip" data-tip="${escHtml(formatDateExact(r.blocked_at))}" style="color:#94a3b8;font-size:0.72rem;">ⓘ</span></td>
@@ -4825,6 +4867,7 @@ document.querySelector('[data-tab="vex"]').addEventListener('click', () => {
 
 // Load on tab switch
 document.querySelector('[data-tab="lag"]').addEventListener('click', () => {
+  lagLoadSourceChips();
   if (!document.getElementById('lag-chart-svg').innerHTML) { lagLoadStats(); lagLoadTable(); }
   else if (!document.getElementById('lag-table-results').innerHTML) lagLoadTable();
 });
