@@ -3986,6 +3986,17 @@ async function malLoadStatus() {
 const SOURCE_NAMES = { chainguard: 'Sentinel', osv: 'OSV', manual: 'Manual', 'ossf-commits': 'OSSF' };
 function srcLabel(s) { return SOURCE_NAMES[s] || s || '—'; }
 
+// Linked OSV advisory id, or '' when the row has no real reference. Only osv-sourced
+// rows carry an advisory id in `malid`; the other sources put a provider name there
+// ('chainguard', 'manual'), so match the MAL-YYYY-N shape instead of trusting the field.
+const MAL_ID_RE = /^MAL-\d+-\d+$/;
+function malIdCell(malid) {
+  const id = (malid || '').trim();
+  if (!MAL_ID_RE.test(id)) return '';
+  return `<a href="https://osv.dev/vulnerability/${encodeURIComponent(id)}" target="_blank" rel="noopener"
+    style="font-family:monospace;font-size:0.75rem;" title="View ${escHtml(id)} on osv.dev">${escHtml(id)}</a>`;
+}
+
 const SOURCE_COLORS = {
   chainguard: '#3b82f6',
   osv:        '#f59e0b',
@@ -4385,6 +4396,7 @@ async function lagLoadDrillDown() {
       <td style="font-size:0.8rem;">${escHtml(r.version||'—')}</td>
       <td style="font-size:0.75rem;"><span style="color:${escHtml(rowSrcColor)};font-weight:600;">●</span> ${escHtml(r.ecosystem)}</td>
       <td style="font-size:0.78rem;white-space:nowrap;" title="${r.source||''}">${escHtml(srcLabel(r.source))}</td>
+      <td style="font-size:0.78rem;white-space:nowrap;">${malIdCell(r.malid)}</td>
       <td style="font-size:0.78rem;white-space:nowrap;" title="${r.published_at||''}">${r.published_at ? escHtml(malFmtDate(r.published_at)) : '—'}</td>
       <td style="font-size:0.78rem;white-space:nowrap;" title="${r.blocked_at}">${escHtml(malFmtDate(r.blocked_at))}</td>
       <td style="font-size:0.78rem;font-weight:600;white-space:nowrap;">${lag!=null ? escHtml(malFmtLag(lag)) : '—'}</td>
@@ -4392,7 +4404,7 @@ async function lagLoadDrillDown() {
   }).join('');
 
   document.getElementById('lag-drilldown-results').innerHTML = `<table style="width:100%;">
-    <thead><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th><th>Published</th><th>Blocked at</th><th>TTD</th></tr></thead>
+    <thead><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th><th>Advisory</th><th>Published</th><th>Blocked at</th><th>TTD</th></tr></thead>
     <tbody>${tbody}</tbody>
   </table>`;
   document.getElementById('lag-drilldown').style.display = 'block';
@@ -4546,7 +4558,7 @@ async function lagLoadTable() {
   }
 
   el.innerHTML = `<div class="table-wrap"><table>
-    <thead><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th><th>Published</th><th>Blocked at</th><th>TTD</th></tr></thead>
+    <thead><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th><th>Advisory</th><th>Published</th><th>Blocked at</th><th>TTD</th></tr></thead>
     <tbody>${res.rows.map(r => {
       const lag = malCalcLag(r.published_at, r.blocked_at);
       const rowSrcColor = srcColor(r.source);
@@ -4557,6 +4569,7 @@ async function lagLoadTable() {
         <td style="font-size:0.78rem;">
           <span style="color:${escHtml(rowSrcColor)};font-weight:600;">●</span> ${escHtml(srcLabel(r.source))}${r.reason?.length ? ` <span class="tip" data-tip="${escHtml(r.reason.join(', '))}" style="color:#94a3b8;font-size:0.72rem;">ⓘ</span>` : ''}
         </td>
+        <td style="font-size:0.78rem;white-space:nowrap;">${malIdCell(r.malid)}</td>
         <td style="font-size:0.78rem;white-space:nowrap;">${r.published_at ? escHtml(malFmtDate(r.published_at)) + ` <span class="tip" data-tip="${escHtml(formatDateExact(r.published_at))}" style="color:#94a3b8;font-size:0.72rem;">ⓘ</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
         <td style="font-size:0.78rem;white-space:nowrap;">${escHtml(malFmtDate(r.blocked_at))} <span class="tip" data-tip="${escHtml(formatDateExact(r.blocked_at))}" style="color:#94a3b8;font-size:0.72rem;">ⓘ</span></td>
         <td style="font-size:0.78rem;font-weight:600;white-space:nowrap;">${lag != null ? escHtml(malFmtLag(lag)) : '<span style="color:#cbd5e1">—</span>'}</td>
