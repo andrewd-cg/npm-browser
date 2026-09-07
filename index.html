@@ -790,6 +790,68 @@
     align-items: center;
     gap: 0.75rem;
   }
+
+  /* ── Print / PDF export ──────────────────────────────────────────────────
+     Only the Dependency Scan prints today. The report is the summary cards,
+     any caveat banners, and the results table on A4 portrait; everything the
+     reader can't act on from paper (nav, the paste box, progress) is dropped.
+     Print styles live here rather than in a media-attribute sheet so the
+     single-file app stays single-file. */
+  .print-only { display: none; }
+  @media print {
+    /* Landscape: seven columns, two of them lists of version chips. Portrait
+       squeezes package names to a few characters and stacks the chips one per
+       line, tripling the page count. Change to `A4 portrait` if a portrait
+       report matters more than the table staying readable. */
+    @page { size: A4 landscape; margin: 10mm 10mm; }
+    /* Keep the status pills and chips legible — without this Chrome drops
+       every background unless the reader ticks "Background graphics". */
+    *, *::before, *::after { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    body { background: #fff; }
+    header, #settings-panel, #scan-form, #scan-progress-wrap, .status-placeholder { display: none !important; }
+    main { max-width: none; margin: 0; padding: 0; }
+    .print-only { display: block; }
+
+    .scan-print-head { margin-bottom: 6mm; }
+    .scan-print-head h2 { font-size: 15pt; font-weight: 800; color: #0f172a; }
+    .scan-print-head .pr-counts { font-size: 9.5pt; color: #1e293b; margin-top: 1.5mm; }
+    .scan-print-head .pr-meta { font-size: 8pt; color: #64748b; margin-top: 1.5mm; line-height: 1.5; }
+
+    /* Cards shrink to a single unbroken band across the top of page 1. */
+    .scan-summary { gap: 3mm; margin-bottom: 5mm; break-inside: avoid; }
+    .scan-card { flex: 1 1 0; min-width: 0; padding: 3mm; border-radius: 2mm; }
+    .scan-card .sc-num { font-size: 15pt; }
+    .scan-card .sc-label { font-size: 6.5pt; margin-top: 1mm; }
+    .banners { margin-bottom: 4mm; }
+    .banner { font-size: 8pt; padding: 2mm 3mm; break-inside: avoid; }
+
+    /* The wrap is for on-screen scrolling; on paper it would clip the table. */
+    .table-wrap { overflow: visible !important; max-height: none !important; border: 0; }
+    table.scan-table { font-size: 7.5pt; width: 100%; }
+    /* Repeat the header on every sheet, and un-stick it — a sticky header
+       prints once and then floats over the body on later pages. */
+    table.scan-table thead { display: table-header-group; }
+    table.scan-table th { position: static; font-size: 6.5pt; padding: 1.5mm 1.5mm; }
+    table.scan-table td { padding: 1.2mm 1.5mm; }
+    table.scan-table tr { break-inside: avoid; }
+    /* Auto layout hands the chip columns most of the width and squeezes package
+       names to 8 characters, so pin the text columns and let the chips flow. */
+    table.scan-table .col-pkg { width: 17%; }
+    table.scan-table .col-ver { width: 7%; }
+    table.scan-table .col-pub { width: 9%; }
+    table.scan-table .col-src { width: 11%; }
+    /* Long maven coordinates and CVE lists need the full column width. */
+    table.scan-table td.mono { font-size: 7pt; word-break: break-word; }
+    table.scan-table .col-src .scan-src { font-size: 5.7pt; word-break: break-all; }
+    .scan-mal-cell, .scan-fix-cell { max-width: none; gap: 2px; }
+    .scan-vchip, .scan-fixchip { font-size: 6.2pt; padding: 0 3px; }
+    .scan-status-pill { font-size: 6pt; padding: 0.5mm 1.5mm; }
+    .scan-src { font-size: 6.2pt; }
+
+    /* "Findings only" — drop the rows with nothing to report. Hiding them in
+       CSS keeps the on-screen table untouched. */
+    #scan-results.print-findings-only tr.row-quiet { display: none; }
+  }
 </style>
 </head>
 <body data-active-tab="npm">
@@ -1016,9 +1078,13 @@
         </label>
         <button type="submit" class="fetch-btn" id="scan-btn">Scan dependencies</button>
         <button type="button" class="copy-btn" onclick="scanClear()">Clear</button>
+        <button type="button" class="copy-btn" id="scan-pdf-btn" disabled
+          title="Opens the print dialog — choose &quot;Save as PDF&quot; as the destination for an A4 report">Export PDF</button>
+        <label class="filter-label" id="scan-print-findings-label" style="display:none;"><input type="checkbox" id="scan-print-findings"> Findings only</label>
         <label class="filter-label" style="margin-left:auto;"><input type="checkbox" id="scan-fetch-dates" checked> Fetch publish dates &amp; sources</label>
       </div>
     </form>
+    <div class="print-only scan-print-head" id="scan-print-head"></div>
     <div class="banners" id="scan-banners"></div>
     <div id="scan-progress-wrap" style="display:none; padding:0 0 0.25rem;" class="bulk-progress">
       <span id="scan-progress-text">Scanning…</span>
@@ -3926,23 +3992,29 @@ function scanRenderTable(eco, packages, showFixes) {
       : p.status === 'had'
         ? '<span class="scan-status-pill had">had malware</span>'
         : '<span class="scan-status-pill clean">clean</span>';
-    const rowCls = p.status === 'exact' ? 'row-exact' : p.status === 'had' ? 'row-had' : '';
+    // A "quiet" row has nothing to report — clean, and no fix waiting at its
+    // version. The PDF export can drop these.
+    const rowCls = p.status === 'exact' ? 'row-exact'
+      : p.status === 'had' ? 'row-had'
+      : p.vexHere?.length ? '' : 'row-quiet';
     const inUse = p.version
       ? escHtml(p.version)
       : (p.spec ? `<span style="color:#94a3b8;" title="No exact == pin — only package-level malware history checked">${escHtml(p.spec)}</span>` : '<span style="color:#cbd5e1">—</span>');
+    // The col-* classes only carry print widths — the fixes column is optional,
+    // so nth-child selectors would land on the wrong column for npm.
     return `<tr class="${rowCls}">
       <td>${pill}</td>
-      <td class="mono">${escHtml(p.name)}${p.dev ? ' <span class="scan-status-pill clean">dev</span>' : ''}</td>
-      <td class="mono">${inUse}</td>
+      <td class="mono col-pkg">${escHtml(p.name)}${p.dev ? ' <span class="scan-status-pill clean">dev</span>' : ''}</td>
+      <td class="mono col-ver">${inUse}</td>
       <td>${scanMalwareCell(eco, p)}</td>
       ${showFixes ? `<td>${scanFixCell(p)}</td>` : ''}
-      <td>${p.published ? escHtml(formatDate(p.published)) : '<span style="color:#cbd5e1">—</span>'}</td>
-      <td>${host ? `<span class="scan-src" title="${escHtml(srcTip)}">${escHtml(host)}</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
+      <td class="col-pub">${p.published ? escHtml(formatDate(p.published)) : '<span style="color:#cbd5e1">—</span>'}</td>
+      <td class="col-src">${host ? `<span class="scan-src" title="${escHtml(srcTip)}">${escHtml(host)}</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
     </tr>`;
   }).join('');
   const fixHead = showFixes ? '<th title="CVEs already fixed in Chainguard\'s build of the version you use">Backported fixes</th>' : '';
   return `<div class="table-wrap"><table class="scan-table">
-    <thead><tr><th>Status</th><th>Package</th><th>In use</th><th>Malware versions</th>${fixHead}<th>Published</th><th>Source</th></tr></thead>
+    <thead><tr><th>Status</th><th class="col-pkg">Package</th><th class="col-ver">In use</th><th>Malware versions</th>${fixHead}<th class="col-pub">Published</th><th class="col-src">Source</th></tr></thead>
     <tbody>${body}</tbody>
   </table></div>`;
 }
@@ -3976,9 +4048,65 @@ function scanRender(data) {
   document.getElementById('scan-results').innerHTML = cards + scanRenderTable(ecosystem, packages, vexCovered);
 }
 
+// Filename when the input came from a file rather than a paste, so a printed
+// report can say what was scanned.
+let _scanSourceName = null;
+
+// Report header — counts and provenance. Lives in the page but only shows in
+// print, so it can't drift from the table it describes.
+async function scanBuildPrintHead(findingsOnly) {
+  const { packages, ecosystem } = state.scan;
+  const unit  = ecosystem === 'maven' ? 'versions' : 'packages';
+  const exact = packages.filter(p => p.status === 'exact').length;
+  const had   = packages.filter(p => p.status === 'had').length;
+  const fixes = packages.filter(p => p.vexHere?.length).length;
+  // A row can be both "had malware" and carry a fix, so count what the print
+  // stylesheet actually hides rather than adding the categories up.
+  const quiet = packages.filter(p => p.status === 'clean' && !p.vexHere?.length).length;
+
+  // Provenance matters on a report someone else reads: name the mirrors and
+  // when they last synced. Best-effort — the header still prints without it.
+  const s = await fetch('/api/cgr-malware/status').then(r => r.json()).catch(() => null);
+  const meta = [
+    _scanSourceName ? `Source: ${_scanSourceName}` : null,
+    `Generated ${formatDateExact(Date.now())}`,
+    s ? `Malware database: ${s.total.toLocaleString()} entries, synced ${s.lastSyncAt ? formatDateExact(s.lastSyncAt) : 'never'}` : null,
+    s?.vex ? `Backported fixes: ${s.vex.fixes.toLocaleString()} across ${s.vex.packages.toLocaleString()} packages, synced ${s.vex.lastSyncAt ? formatDateExact(s.vex.lastSyncAt) : 'never'}` : null,
+    findingsOnly ? `Findings only — showing ${(packages.length - quiet).toLocaleString()} of ${packages.length.toLocaleString()} rows` : null,
+  ].filter(Boolean);
+
+  document.getElementById('scan-print-head').innerHTML = `
+    <h2>Dependency scan — ${escHtml(SCAN_ECO_LABELS[ecosystem] || ecosystem)}</h2>
+    <div class="pr-counts">${packages.length.toLocaleString()} ${unit} scanned ·
+      ${exact.toLocaleString()} known malware · ${had.toLocaleString()} has had malware ·
+      ${fixes.toLocaleString()} with backported fixes</div>
+    <div class="pr-meta">${meta.map(escHtml).join('<br>')}</div>`;
+}
+
+// Export = the browser's own print pipeline with an A4 stylesheet, so the PDF
+// keeps selectable text and paginates a 10k-row table properly. No library.
+async function scanExportPdf() {
+  if (!state.scan.packages) return;
+  const btn = document.getElementById('scan-pdf-btn');
+  const findingsOnly = document.getElementById('scan-print-findings').checked;
+  btn.disabled = true;
+  try {
+    document.getElementById('scan-results').classList.toggle('print-findings-only', findingsOnly);
+    await scanBuildPrintHead(findingsOnly);
+    window.print();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function scanClear() {
   document.getElementById('scan-input').value = '';
   document.getElementById('scan-banners').innerHTML = '';
+  document.getElementById('scan-print-head').innerHTML = '';
+  document.getElementById('scan-pdf-btn').disabled = true;
+  document.getElementById('scan-print-findings-label').style.display = 'none';
+  state.scan = { packages: null };
+  _scanSourceName = null;
   document.getElementById('scan-results').innerHTML = `<div class="status-placeholder">
     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
     Upload a package-lock.json, requirements.txt, or a list of Maven group:artifact:version coordinates to check every dependency against the malware database and for backported CVE fixes
@@ -3987,11 +4115,13 @@ function scanClear() {
 
 function scanLoadFile(file) {
   if (!file) return;
+  _scanSourceName = file.name;
   const reader = new FileReader();
   reader.onload = (ev) => { document.getElementById('scan-input').value = ev.target.result; };
   reader.readAsText(file);
 }
 
+document.getElementById('scan-pdf-btn').addEventListener('click', scanExportPdf);
 document.getElementById('scan-file-input').addEventListener('change', (e) => scanLoadFile(e.target.files[0]));
 {
   const sdz = document.getElementById('scan-drop-zone');
@@ -4098,6 +4228,8 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
     banners.innerHTML = notes.join('');
     state.scan = { packages, ecosystem, vexCovered };
     scanRender({ packages, ecosystem, vexCovered });
+    document.getElementById('scan-pdf-btn').disabled = false;
+    document.getElementById('scan-print-findings-label').style.display = '';
   } catch (err) {
     document.getElementById('scan-results').innerHTML =
       `<div class="status-placeholder">Unexpected error: ${escHtml(err.message)}</div>`;
