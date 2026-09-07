@@ -3783,19 +3783,18 @@ function scanClassify(pkg, malRows) {
   return { status: 'had', malRows: malRows.filter(m => m.version) };
 }
 
-// Split a package's backported-fix statements into the ones that apply to the
-// version in use and the ones that only exist for other versions. Matching is
-// on both the upstream base version and the full cgr build version, as on the
+// A package's backported fixes for the version in use — fixes for any other
+// version don't apply without an upgrade, so they're dropped. Matching is on
+// both the upstream base version and the full cgr build version, as on the
 // package tabs. `builds` names the Chainguard builds carrying the fixes.
 function scanVexInfo(fixes, version) {
-  if (!fixes || !fixes.length) return { vexHere: [], vexBuilds: [], vexOther: 0 };
-  const here = version ? (buildVexMap(fixes).get(version) || []) : [];
-  const hereIds = new Set(here.map(vexVulnId));
-  const builds = [...new Set(fixes
-    .filter(f => f.baseVersion === version || f.fullVersion === version)
-    .map(f => f.fullVersion))];
-  const other = new Set(fixes.map(f => vexVulnId(f.vuln)).filter(id => id && !hereIds.has(id)));
-  return { vexHere: here, vexBuilds: builds, vexOther: other.size };
+  if (!fixes || !fixes.length || !version) return { vexHere: [], vexBuilds: [] };
+  return {
+    vexHere: buildVexMap(fixes).get(version) || [],
+    vexBuilds: [...new Set(fixes
+      .filter(f => f.baseVersion === version || f.fullVersion === version)
+      .map(f => f.fullVersion))],
+  };
 }
 
 function scanSourceHost(resolved) {
@@ -3954,15 +3953,11 @@ function scanMalwareCell(eco, p) {
 
 // The "Backported fixes" cell: one chip per CVE Chainguard's build of the
 // version in use already fixes, so the vulnerability goes away without an
-// upgrade. Falls back to a muted count when fixes exist only for other versions.
+// upgrade.
 const SCAN_MAX_FIXCHIPS = 8;
 function scanFixCell(p) {
-  const { vexHere = [], vexBuilds = [], vexOther = 0 } = p;
-  if (!vexHere.length) {
-    return vexOther
-      ? `<div class="scan-fix-cell"><span class="scan-fixchip muted" title="Chainguard backports fixes for this package, but not for ${escHtml(p.version || 'the version in use')} — upgrade to a version that has them">${vexOther} at other versions</span></div>`
-      : '<span style="color:#cbd5e1">—</span>';
-  }
+  const { vexHere = [], vexBuilds = [] } = p;
+  if (!vexHere.length) return '<span style="color:#cbd5e1">—</span>';
   const buildTip = vexBuilds.length ? `Chainguard build: ${vexBuilds.join(', ')}` : null;
   const chips = vexHere.slice(0, SCAN_MAX_FIXCHIPS).map(v => {
     const tip = [`${vexVulnId(v)} — fixed in Chainguard's build of ${p.version}`, buildTip,
@@ -3973,8 +3968,7 @@ function scanFixCell(p) {
   const more = extra > 0
     ? `<span class="scan-fixchip muted" title="${escHtml(vexHere.slice(SCAN_MAX_FIXCHIPS).map(vexVulnId).join(', '))}">+${extra} more</span>`
     : '';
-  const elsewhere = vexOther ? `<span class="scan-fixchip muted" title="Fixes Chainguard backports for other versions of this package">+${vexOther} at other versions</span>` : '';
-  return `<div class="scan-fix-cell">${chips}${more}${elsewhere}</div>`;
+  return `<div class="scan-fix-cell">${chips}${more}</div>`;
 }
 
 function scanRenderTable(eco, packages, showFixes) {
@@ -4053,9 +4047,9 @@ function scanRender(data) {
 // report can say what was scanned.
 let _scanSourceName = null;
 
-// Report header — counts and provenance. Lives in the page but only shows in
-// print, so it can't drift from the table it describes.
-async function scanBuildPrintHead(findingsOnly) {
+// Report header — counts and what the table below covers. Lives in the page but
+// only shows in print, so it can't drift from the table it describes.
+function scanBuildPrintHead(findingsOnly) {
   const { packages, ecosystem } = state.scan;
   const unit  = ecosystem === 'maven' ? 'versions' : 'packages';
   const exact = packages.filter(p => p.status === 'exact').length;
@@ -4065,16 +4059,11 @@ async function scanBuildPrintHead(findingsOnly) {
   // stylesheet actually hides rather than adding the categories up.
   const quiet = packages.filter(p => p.status === 'clean' && !p.vexHere?.length).length;
 
-  // Provenance matters on a report someone else reads: name the mirrors and
-  // when they last synced. Best-effort — the header still prints without it.
-  const s = await fetch('/api/cgr-malware/status').then(r => r.json()).catch(() => null);
   const meta = [
     _scanSourceName ? `Source: ${_scanSourceName}` : null,
     `Generated ${formatDateExact(Date.now())}`,
-    s ? `Malware database: ${s.total.toLocaleString()} entries, synced ${s.lastSyncAt ? formatDateExact(s.lastSyncAt) : 'never'}` : null,
-    s?.vex ? `Backported fixes: ${s.vex.fixes.toLocaleString()} across ${s.vex.packages.toLocaleString()} packages, synced ${s.vex.lastSyncAt ? formatDateExact(s.vex.lastSyncAt) : 'never'}` : null,
     findingsOnly
-      ? `Findings only: ${(packages.length - quiet).toLocaleString()} of ${packages.length.toLocaleString()} ${unit} — known malware, malware history, or a backported fix for the version in use. The other ${quiet.toLocaleString()} were clean, with no fix available for the version in use.`
+      ? `Findings: ${(packages.length - quiet).toLocaleString()} of ${packages.length.toLocaleString()} ${unit} — known malware, malware history, or a backported fix for the version in use. The other ${quiet.toLocaleString()} were clean, with no fix available for the version in use.`
       : `All ${packages.length.toLocaleString()} scanned ${unit} listed, including the ${quiet.toLocaleString()} with nothing to report.`,
   ].filter(Boolean);
 
@@ -4088,20 +4077,14 @@ async function scanBuildPrintHead(findingsOnly) {
 
 // Export = the browser's own print pipeline with an A4 stylesheet, so the PDF
 // keeps selectable text and paginates a 10k-row table properly. No library.
-async function scanExportPdf() {
+function scanExportPdf() {
   if (!state.scan.packages) return;
-  const btn = document.getElementById('scan-pdf-btn');
   // Findings by default — a clean row costs a line of paper and tells the
   // reader nothing. "Include clean rows" opts back into the full table.
   const findingsOnly = !document.getElementById('scan-print-all').checked;
-  btn.disabled = true;
-  try {
-    document.getElementById('scan-results').classList.toggle('print-findings-only', findingsOnly);
-    await scanBuildPrintHead(findingsOnly);
-    window.print();
-  } finally {
-    btn.disabled = false;
-  }
+  document.getElementById('scan-results').classList.toggle('print-findings-only', findingsOnly);
+  scanBuildPrintHead(findingsOnly);
+  window.print();
 }
 
 function scanClear() {
