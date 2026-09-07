@@ -402,6 +402,7 @@
   .banner { padding: 8px 14px; border-radius: 6px; font-size: 0.85rem; display: flex; align-items: center; gap: 0.5rem; }
   .banner.warn  { background: #fef9c3; color: #854d0e; border: 1px solid #fde68a; }
   .banner.error { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+  .banner.info  { background: #f0f9ff; color: #075985; border: 1px solid #bae6fd; }
 
   /* Results card */
   .results { background: #fff; border-radius: 10px; border: 1px solid #e2e8f0; overflow: hidden; }
@@ -672,6 +673,9 @@
   .scan-card.ok      { background:#f0fdf4; border-color:#86efac; }
   .scan-card.ok      .sc-num { color:#15803d; }
   .scan-card.total   .sc-num { color:#1e293b; }
+  /* backported fixes — shield blue, not the green of the "clean" card */
+  .scan-card.fix     { background:#f0f9ff; border-color:#7dd3fc; }
+  .scan-card.fix     .sc-num { color:#0369a1; }
   /* malware-version chips shown inline in the table (wrap within a bounded cell) */
   .scan-mal-cell { display:flex; flex-wrap:wrap; gap:4px; max-width:260px; }
   .scan-vchip {
@@ -683,6 +687,15 @@
   .scan-vchip.near { background:#fca5a5; color:#7f1d1d; border-color:#f87171; font-weight:700; }  /* darker pastel red = malicious, near your version */
   .scan-vchip.inuse { background:#dc2626; color:#fff; border-color:#b91c1c; font-weight:700; gap:5px; }
   .scan-inuse-tag { font-size:0.6rem; font-weight:700; }
+  /* backported-fix chips — green, matching the .badge-vex used on the package tabs */
+  .scan-fix-cell { display:flex; flex-wrap:wrap; gap:4px; max-width:260px; }
+  .scan-fixchip {
+    font-family:'SFMono-Regular',Consolas,monospace; font-size:0.72rem; padding:1px 6px;
+    border-radius:5px; display:inline-flex; align-items:center;
+    white-space:nowrap; cursor:help;
+    background:#dcfce7; color:#166534; border:1px solid #86efac;
+  }
+  .scan-fixchip.muted { background:#f8fafc; color:#64748b; border-color:#e2e8f0; }
   table.scan-table { width:100%; border-collapse:collapse; font-size:0.82rem; }
   table.scan-table th, table.scan-table td { padding:6px 10px; text-align:left; border-bottom:1px solid #f1f5f9; vertical-align:top; }
   table.scan-table th { font-size:0.72rem; text-transform:uppercase; letter-spacing:0.04em; color:#64748b; background:#f8fafc; position:sticky; top:0; }
@@ -1014,7 +1027,7 @@
     <div class="results" id="scan-results">
       <div class="status-placeholder">
         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        Upload a package-lock.json or requirements.txt to scan every dependency against the malware database
+        Upload a package-lock.json or requirements.txt to check every dependency against the malware database and for backported CVE fixes
       </div>
     </div>
   </div>
@@ -1383,14 +1396,18 @@ function malwareBadgeHtml(m) {
 // Chainguard Libraries VEX: build a version → [vuln] map from the /api/cgr-vex
 // response. Keyed by BOTH the upstream base version and the full cgr build
 // version so a row matches whichever form it displays. Vulns deduped per key.
+// Preferred public id for a vulnerability: CVE if it has one, else GHSA, else
+// the Chainguard CGA id the feed keys on.
+function vexVulnId(v) { return v.cve || v.ghsa || v.name; }
+
 function buildVexMap(fixes) {
   const m = new Map();
   const add = (key, vuln) => {
     if (!key) return;
     let arr = m.get(key);
     if (!arr) { arr = []; m.set(key, arr); }
-    const id = vuln.cve || vuln.ghsa || vuln.name;
-    if (!arr.some(x => (x.cve || x.ghsa || x.name) === id)) arr.push(vuln);
+    const id = vexVulnId(vuln);
+    if (!arr.some(x => vexVulnId(x) === id)) arr.push(vuln);
   };
   for (const f of (fixes || [])) {
     add(f.baseVersion, f.vuln);
@@ -1403,7 +1420,7 @@ function buildVexMap(fixes) {
 // Chainguard build backports one or more upstream vulnerability fixes.
 function vexBadgeHtml(vulns) {
   if (!vulns || !vulns.length) return '';
-  const ids = vulns.map(v => v.cve || v.ghsa || v.name).filter(Boolean);
+  const ids = vulns.map(vexVulnId).filter(Boolean);
   const n = vulns.length;
   const tip = [
     `Chainguard's build of this version backports ${n} upstream fix${n === 1 ? '' : 'es'}:`,
@@ -3654,6 +3671,21 @@ function scanClassify(pkg, malRows) {
   return { status: 'had', malRows: malRows.filter(m => m.version) };
 }
 
+// Split a package's backported-fix statements into the ones that apply to the
+// version in use and the ones that only exist for other versions. Matching is
+// on both the upstream base version and the full cgr build version, as on the
+// package tabs. `builds` names the Chainguard builds carrying the fixes.
+function scanVexInfo(fixes, version) {
+  if (!fixes || !fixes.length) return { vexHere: [], vexBuilds: [], vexOther: 0 };
+  const here = version ? (buildVexMap(fixes).get(version) || []) : [];
+  const hereIds = new Set(here.map(vexVulnId));
+  const builds = [...new Set(fixes
+    .filter(f => f.baseVersion === version || f.fullVersion === version)
+    .map(f => f.fullVersion))];
+  const other = new Set(fixes.map(f => vexVulnId(f.vuln)).filter(id => id && !hereIds.has(id)));
+  return { vexHere: here, vexBuilds: builds, vexOther: other.size };
+}
+
 function scanSourceHost(resolved) {
   if (!resolved) return null;
   try { return new URL(resolved).host; } catch { return resolved; }
@@ -3760,10 +3792,39 @@ function scanMalwareCell(eco, p) {
   return `<div class="scan-mal-cell">${chips}</div>`;
 }
 
-function scanRenderTable(eco, packages) {
+// The "Backported fixes" cell: one chip per CVE Chainguard's build of the
+// version in use already fixes, so the vulnerability goes away without an
+// upgrade. Falls back to a muted count when fixes exist only for other versions.
+const SCAN_MAX_FIXCHIPS = 8;
+function scanFixCell(p) {
+  const { vexHere = [], vexBuilds = [], vexOther = 0 } = p;
+  if (!vexHere.length) {
+    return vexOther
+      ? `<div class="scan-fix-cell"><span class="scan-fixchip muted" title="Chainguard backports fixes for this package, but not for ${escHtml(p.version || 'the version in use')} — upgrade to a version that has them">${vexOther} at other versions</span></div>`
+      : '<span style="color:#cbd5e1">—</span>';
+  }
+  const buildTip = vexBuilds.length ? `Chainguard build: ${vexBuilds.join(', ')}` : null;
+  const chips = vexHere.slice(0, SCAN_MAX_FIXCHIPS).map(v => {
+    const tip = [`${vexVulnId(v)} — fixed in Chainguard's build of ${p.version}`, buildTip,
+      v.aliases?.length > 1 ? `Aliases: ${v.aliases.join(', ')}` : null].filter(Boolean).join('\n');
+    return `<span class="scan-fixchip" title="${escHtml(tip)}">${escHtml(vexVulnId(v))}</span>`;
+  }).join('');
+  const extra = vexHere.length - SCAN_MAX_FIXCHIPS;
+  const more = extra > 0
+    ? `<span class="scan-fixchip muted" title="${escHtml(vexHere.slice(SCAN_MAX_FIXCHIPS).map(vexVulnId).join(', '))}">+${extra} more</span>`
+    : '';
+  const elsewhere = vexOther ? `<span class="scan-fixchip muted" title="Fixes Chainguard backports for other versions of this package">+${vexOther} at other versions</span>` : '';
+  return `<div class="scan-fix-cell">${chips}${more}${elsewhere}</div>`;
+}
+
+function scanRenderTable(eco, packages, showFixes) {
   const order = { exact: 0, had: 1, clean: 2 };
+  // Within a status group, packages with a backported fix for the version in
+  // use sort first — otherwise they're lost among hundreds of clean rows.
+  const fixRank = p => (p.vexHere?.length ? 0 : 1);
   const rows = packages.slice().sort((a, b) =>
-    (order[a.status] - order[b.status]) || a.name.localeCompare(b.name) || scanVerCompare(eco, a.version, b.version));
+    (order[a.status] - order[b.status]) || (fixRank(a) - fixRank(b))
+    || a.name.localeCompare(b.name) || scanVerCompare(eco, a.version, b.version));
   const body = rows.map(p => {
     const host = scanSourceHost(p.resolved);
     const srcTip = [p.resolved, p.integrity].filter(Boolean).join('\n');
@@ -3781,30 +3842,41 @@ function scanRenderTable(eco, packages) {
       <td class="mono">${escHtml(p.name)}${p.dev ? ' <span class="scan-status-pill clean">dev</span>' : ''}</td>
       <td class="mono">${inUse}</td>
       <td>${scanMalwareCell(eco, p)}</td>
+      ${showFixes ? `<td>${scanFixCell(p)}</td>` : ''}
       <td>${p.published ? escHtml(formatDate(p.published)) : '<span style="color:#cbd5e1">—</span>'}</td>
       <td>${host ? `<span class="scan-src" title="${escHtml(srcTip)}">${escHtml(host)}</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
     </tr>`;
   }).join('');
+  const fixHead = showFixes ? '<th title="CVEs already fixed in Chainguard\'s build of the version you use">Backported fixes</th>' : '';
   return `<div class="table-wrap"><table class="scan-table">
-    <thead><tr><th>Status</th><th>Package</th><th>In use</th><th>Malware versions</th><th>Published</th><th>Source</th></tr></thead>
+    <thead><tr><th>Status</th><th>Package</th><th>In use</th><th>Malware versions</th>${fixHead}<th>Published</th><th>Source</th></tr></thead>
     <tbody>${body}</tbody>
   </table></div>`;
 }
 
 function scanRender(data) {
-  const { packages, ecosystem } = data;
+  const { packages, ecosystem, vexCovered } = data;
   const exact = packages.filter(p => p.status === 'exact').length;
   const had   = packages.filter(p => p.status === 'had').length;
   const clean = packages.length - exact - had;
+
+  // Distinct CVEs, not statements — the same CVE is often backported across
+  // several of a lockfile's packages.
+  const withFixes = packages.filter(p => p.vexHere?.length);
+  const fixedCves = new Set(withFixes.flatMap(p => p.vexHere.map(vexVulnId)));
+  const fixCard = vexCovered ? `<div class="scan-card fix"
+      title="${fixedCves.size} distinct vulnerabilities are already fixed in Chainguard's builds of the versions you pin — no upgrade needed">
+    <div class="sc-num">${withFixes.length}</div><div class="sc-label">🛡 Backported fixes</div></div>` : '';
 
   const cards = `<div class="scan-summary">
     <div class="scan-card total"><div class="sc-num">${packages.length}</div><div class="sc-label">Packages scanned</div></div>
     <div class="scan-card danger"><div class="sc-num">${exact}</div><div class="sc-label">Known malware</div></div>
     <div class="scan-card warn"><div class="sc-num">${had}</div><div class="sc-label">Has had malware</div></div>
     <div class="scan-card ok"><div class="sc-num">${clean}</div><div class="sc-label">Clean</div></div>
+    ${fixCard}
   </div>`;
 
-  document.getElementById('scan-results').innerHTML = cards + scanRenderTable(ecosystem, packages);
+  document.getElementById('scan-results').innerHTML = cards + scanRenderTable(ecosystem, packages, vexCovered);
 }
 
 function scanClear() {
@@ -3812,7 +3884,7 @@ function scanClear() {
   document.getElementById('scan-banners').innerHTML = '';
   document.getElementById('scan-results').innerHTML = `<div class="status-placeholder">
     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-    Upload a package-lock.json or requirements.txt to scan every dependency against the malware database
+    Upload a package-lock.json or requirements.txt to check every dependency against the malware database and for backported CVE fixes
   </div>`;
 }
 
@@ -3880,7 +3952,23 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
       Object.assign(p, scanClassify(p, rows));
     }
 
-    // 2) Optionally enrich with publish dates (and PyPI source URLs).
+    // 2) Backported CVE fixes: which pinned versions Chainguard already ships a
+    //    patched build of. One bulk lookup, keyed by PEP 503 name (the form the
+    //    VEX mirror stores). The feed covers PyPI and Maven, not npm.
+    progressText.textContent = 'Checking for backported CVE fixes…';
+    const vexRes = await fetch('/api/cgr-vex/bulk-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ecosystem, packages: packages.map(p => p.name) }),
+    }).then(r => r.ok ? r.json() : null).catch(() => null);
+    const vexCovered = !!vexRes?.covered;
+    if (vexCovered) {
+      for (const p of packages) {
+        Object.assign(p, scanVexInfo(vexRes.results[pep503(p.name)], p.version));
+      }
+    }
+
+    // 3) Optionally enrich with publish dates (and PyPI source URLs).
     if (document.getElementById('scan-fetch-dates').checked) {
       const byName = await scanFetchDates(ecosystem, packages, (done, total) => {
         progressFill.style.width = `${Math.round(done / total * 100)}%`;
@@ -3893,14 +3981,21 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
       }
     }
 
+    const notes = [];
     const flagged = packages.some(p => p.status !== 'clean');
     if (ecosystem === 'npm' && parsed.lockfileVersion < 2 && !flagged) {
-      banners.innerHTML = `<div class="banner warn">Parsed a lockfileVersion 1 file — for the most complete transitive coverage, regenerate with a modern npm (lockfileVersion 3).</div>`;
+      notes.push(`<div class="banner warn">Parsed a lockfileVersion 1 file — for the most complete transitive coverage, regenerate with a modern npm (lockfileVersion 3).</div>`);
     } else if (ecosystem === 'pypi' && parsed.unpinned > 0) {
-      banners.innerHTML = `<div class="banner warn">${parsed.unpinned} of ${packages.length} requirement${parsed.unpinned !== 1 ? 's are' : ' is'} not pinned to an exact <code>==</code> version — those can only be checked for package-level malware history, not an exact-version hit. For a complete scan, use a fully pinned file (e.g. <code style="font-family:monospace;background:#fef3c7;padding:1px 4px;border-radius:3px">uv pip compile</code> output or <code style="font-family:monospace;background:#fef3c7;padding:1px 4px;border-radius:3px">pip freeze</code>).</div>`;
+      notes.push(`<div class="banner warn">${parsed.unpinned} of ${packages.length} requirement${parsed.unpinned !== 1 ? 's are' : ' is'} not pinned to an exact <code>==</code> version — those can only be checked for package-level malware history, not an exact-version hit. For a complete scan, use a fully pinned file (e.g. <code style="font-family:monospace;background:#fef3c7;padding:1px 4px;border-radius:3px">uv pip compile</code> output or <code style="font-family:monospace;background:#fef3c7;padding:1px 4px;border-radius:3px">pip freeze</code>).</div>`);
     }
-    state.scan = { packages, ecosystem };
-    scanRender({ packages, ecosystem });
+    if (!vexCovered) {
+      notes.push(`<div class="banner info">Chainguard's <a href="https://libraries.cgr.dev/openvex/v1/all.json" target="_blank" rel="noopener" style="color:#0369a1;">backported-fix feed</a> covers PyPI and Maven only, so this ${ecoLabel} scan checks malware alone.</div>`);
+    } else if (vexRes && !vexRes.warm) {
+      notes.push(`<div class="banner warn">The backported-fix mirror is still filling — rerun the scan shortly for complete CVE coverage.</div>`);
+    }
+    banners.innerHTML = notes.join('');
+    state.scan = { packages, ecosystem, vexCovered };
+    scanRender({ packages, ecosystem, vexCovered });
   } catch (err) {
     document.getElementById('scan-results').innerHTML =
       `<div class="status-placeholder">Unexpected error: ${escHtml(err.message)}</div>`;

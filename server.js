@@ -1043,15 +1043,18 @@ function vexBaseVersion(v) {
     .replace(/[-.]cgr\.\d+$/i, '');  // defensive: other cgr build forms
 }
 
-function vexIdFor(eco, pkg) {
-  if (eco === 'pypi') {
-    const norm = pkg.toLowerCase().replace(/[-_.]+/g, '-'); // PEP 503 normalization
-    return `pypi/${norm}.openvex.json`;
-  }
-  if (eco === 'maven') {
-    return `maven/${pkg.replace('/', ':')}.openvex.json`; // pkg = group:artifact
-  }
+// Package name in the form the feed — and the `vex` table — uses: PEP 503 for
+// pypi, `group:artifact` for maven. null for any other ecosystem (the feed
+// publishes pypi and maven only).
+function vexNormPkg(eco, pkg) {
+  if (eco === 'pypi')  return pkg.toLowerCase().replace(/[-_.]+/g, '-');
+  if (eco === 'maven') return pkg.replace('/', ':');
   return null;
+}
+
+function vexIdFor(eco, pkg) {
+  const norm = vexNormPkg(eco, pkg);
+  return norm ? `${eco}/${norm}.openvex.json` : null;
 }
 
 // id → package_name as stored in the DB. `pypi/aiohttp.openvex.json` → `aiohttp`;
@@ -1094,6 +1097,30 @@ function dbVexFixes(eco, normPkg) {
     baseVersion: r.base_version,
     vuln: { name: r.vuln_name, cve: r.cve, ghsa: r.ghsa, aliases: JSON.parse(r.aliases_json || '[]') },
   }));
+}
+
+// Same rows for many packages at once, keyed by the normalized package name.
+// Lets a whole lockfile be checked in one request instead of one per package.
+function dbVexFixesBulk(eco, normNames) {
+  const results = {};
+  const CHUNK = 500;
+  for (let i = 0; i < normNames.length; i += CHUNK) {
+    const chunk = normNames.slice(i, i + CHUNK);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT package_name, base_version, full_version, vuln_name, cve, ghsa, aliases_json, fixed_at
+      FROM vex WHERE ecosystem = ? AND package_name IN (${placeholders})
+    `).all(eco, ...chunk);
+    for (const r of rows) {
+      (results[r.package_name] ||= []).push({
+        fullVersion: r.full_version,
+        baseVersion: r.base_version,
+        fixedAt: r.fixed_at,
+        vuln: { name: r.vuln_name, cve: r.cve, ghsa: r.ghsa, aliases: JSON.parse(r.aliases_json || '[]') },
+      });
+    }
+  }
+  return results;
 }
 
 async function liveVexFixes(id) {
@@ -1463,6 +1490,24 @@ Bun.serve({
       if (!pkg) return new Response(JSON.stringify({ fixes: [] }), { headers: { 'Content-Type': 'application/json' } });
       const fixes = await vexFixesFor(eco, pkg);
       return new Response(JSON.stringify({ eco, package: pkg, fixes }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Bulk backported-fix lookup for a list of package names (Dependency Scan
+    // tab). Results are keyed by the normalized name — PEP 503 for pypi,
+    // `group:artifact` for maven — so callers normalize the same way to read
+    // them. `covered` is false for ecosystems the feed doesn't publish (npm).
+    if (url.pathname === '/api/cgr-vex/bulk-check' && req.method === 'POST') {
+      const body = await req.json().catch(() => ({}));
+      const eco = body.ecosystem === 'pypi' || body.ecosystem === 'maven' ? body.ecosystem : null;
+      const json = (o) => new Response(JSON.stringify(o), { headers: { 'Content-Type': 'application/json' } });
+      if (!eco) return json({ ecosystem: body.ecosystem || null, covered: false, warm: vexWarm, results: {} });
+      // The whole feed is a ~200-doc rebuild, so warming the mirror beats a
+      // live per-package fetch across a lockfile of hundreds of names.
+      if (!vexWarm) await runVexSync().catch(() => {});
+      const names = Array.isArray(body.packages)
+        ? [...new Set(body.packages.filter(n => typeof n === 'string' && n).map(n => vexNormPkg(eco, n)))]
+        : [];
+      return json({ ecosystem: eco, covered: true, warm: vexWarm, results: dbVexFixesBulk(eco, names) });
     }
 
     // Browse all backported fixes, newest first. Free-text `q` matches package
