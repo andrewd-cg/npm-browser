@@ -1003,7 +1003,7 @@
     <form class="search-box" id="scan-form" style="flex-wrap:wrap; gap:0.5rem;">
       <div class="bulk-drop-zone" id="scan-drop-zone">
         <textarea id="scan-input" class="pkg-input"
-          placeholder="Paste or drag &amp; drop an npm package-lock.json or a Python requirements.txt / poetry.lock — every pinned package is checked against the Chainguard malware database"
+          placeholder="Paste or drag &amp; drop an npm package-lock.json, a Python requirements.txt / poetry.lock, or a list of Maven group:artifact:version coordinates — every pinned package is checked against the Chainguard malware database and for backported CVE fixes"
           rows="6"
           style="resize:vertical; font-family:'SFMono-Regular',Consolas,monospace; font-size:0.82rem; width:100%; box-sizing:border-box; height:auto;"
           spellcheck="false"
@@ -1027,7 +1027,7 @@
     <div class="results" id="scan-results">
       <div class="status-placeholder">
         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        Upload a package-lock.json or requirements.txt to check every dependency against the malware database and for backported CVE fixes
+        Upload a package-lock.json, requirements.txt, or a list of Maven group:artifact:version coordinates to check every dependency against the malware database and for backported CVE fixes
       </div>
     </div>
   </div>
@@ -3570,7 +3570,8 @@ function scanExactPin(spec) {
 }
 
 // Dispatch on file shape: JSON → npm package-lock; [[package]] → poetry.lock;
-// otherwise → requirements.txt. Returns { ecosystem, packages, ... } or { error }.
+// coordinate lines → Maven GAV list; otherwise → requirements.txt.
+// Returns { ecosystem, packages, ... } or { error }.
 function scanParse(text) {
   const trimmed = text.trim();
   if (trimmed.startsWith('{')) {
@@ -3584,7 +3585,51 @@ function scanParse(text) {
   // Fallback heuristic: indented version lines with quotes are yarn classic
   if (trimmed.includes('# yarn lockfile') || trimmed.startsWith('__metadata:') ||
       /\n  version "[^"]+"/.test(trimmed)) return scanParseYarnLock(trimmed);
+  if (scanLooksLikeGav(trimmed)) return scanParseGav(trimmed);
   return scanParseRequirements(trimmed);
+}
+
+// Maven coordinate lists — one `group:artifact:version` per line, the shape a
+// GAR / Artifact Registry export or a Gradle dependency dump produces. The
+// longer Gradle forms (`group:artifact:packaging[:classifier]:version`) put the
+// version last too, so the tail is read from the right.
+const GAV_RE = /^([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+)((?::[^\s:]+){1,3})$/;
+
+const SCAN_ECO_LABELS = { npm: 'npm', pypi: 'PyPI', maven: 'Maven' };
+
+// Strip the decoration a copied list picks up: comments, quotes, trailing commas.
+function scanGavLines(text) {
+  return text.split('\n')
+    .map(l => l.trim().replace(/,$/, '').replace(/^['"]|['"]$/g, '').trim())
+    .filter(l => l && !l.startsWith('#') && !l.startsWith('//'));
+}
+
+// A coordinate list carries no header to key off, so it's recognized by shape:
+// nearly every line has to parse as a Maven coordinate. requirements.txt lines
+// use `==` and npm/yarn locks are caught earlier, so the two don't collide.
+function scanLooksLikeGav(text) {
+  const lines = scanGavLines(text);
+  if (!lines.length) return false;
+  return lines.filter(l => GAV_RE.test(l)).length / lines.length >= 0.8;
+}
+
+function scanParseGav(text) {
+  const out = [];
+  const seen = new Set();
+  let skipped = 0;
+  for (const line of scanGavLines(text)) {
+    const m = GAV_RE.exec(line);
+    if (!m) { skipped++; continue; }
+    const [group, artifact] = [m[1], m[2]];
+    const version = m[3].split(':').filter(Boolean).at(-1);
+    const name = `${group}:${artifact}`;
+    const key = `${name}@${version}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ name, group, artifact, version, resolved: null, integrity: null, dev: false });
+  }
+  if (!out.length) return { error: 'No Maven coordinates found — expected one "group:artifact:version" per line.' };
+  return { ecosystem: 'maven', packages: out, skipped };
 }
 
 function scanParseYarnLock(text) {
@@ -3691,10 +3736,51 @@ function scanSourceHost(resolved) {
   try { return new URL(resolved).host; } catch { return resolved; }
 }
 
+// Maven publishes no bulk "every release with its date" endpoint, so dates come
+// from a HEAD on each version's POM, batched per artifact and only for the
+// versions in use. A GAR export can list thousands of coordinates, so the total
+// is capped and the shortfall reported rather than silently dropped.
+const SCAN_MAVEN_DATE_CAP = 500;
+async function scanFetchMavenDates(packages, onProgress) {
+  const byArtifact = new Map();
+  for (const p of packages) {
+    if (!p.version) continue;
+    let e = byArtifact.get(p.name);
+    if (!e) { e = { group: p.group, artifact: p.artifact, versions: [] }; byArtifact.set(p.name, e); }
+    e.versions.push(p.version);
+  }
+  const entries = [];
+  let budget = SCAN_MAVEN_DATE_CAP, skipped = 0;
+  for (const [name, e] of byArtifact) {
+    if (budget <= 0) { skipped += e.versions.length; continue; }
+    const versions = e.versions.slice(0, budget);
+    skipped += e.versions.length - versions.length;
+    budget -= versions.length;
+    entries.push({ name, ...e, versions });
+  }
+
+  const byName = new Map();
+  let done = 0;
+  await runWithConcurrency(entries, 8, async ({ name, group, artifact, versions }) => {
+    try {
+      const res = await fetch('/api/maven-dates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group, artifact, versions }),
+      });
+      if (res.ok) byName.set(name, { times: await res.json(), sources: {} });
+    } catch { /* leave undated */ }
+    done++;
+    onProgress(done, entries.length);
+  });
+  return { byName, skipped };
+}
+
 // Fetch publish dates (and, for PyPI, source URLs) per package name, keyed
 // name → { times: {version: iso}, sources: {version: url} }. Cached per name so
 // duplicated packages only cost one request. Registries allow cross-origin GETs.
 async function scanFetchDates(eco, packages, onProgress) {
+  if (eco === 'maven') return scanFetchMavenDates(packages, onProgress);
   const names = [...new Set(packages.map(p => p.name))];
   const byName = new Map();
   let done = 0;
@@ -3721,7 +3807,7 @@ async function scanFetchDates(eco, packages, onProgress) {
     done++;
     onProgress(done, names.length);
   });
-  return byName;
+  return { byName, skipped: 0 };
 }
 
 // Multi-line tooltip text for one malware DB row.
@@ -3738,9 +3824,16 @@ function scanMalMeta(m) {
 // Version proximity of a flagged version to the pinned one — ecosystem-aware
 // (npm semver vs PEP 440). "patch" = same major.minor, "minor" = same major.
 const SCAN_DIST_RANK = { patch: 0, minor: 1, major: 2 };
-function scanVerCompare(eco, a, b) { return eco === 'pypi' ? pypiVersionCompare(a, b) : semverCompare(a, b); }
+function scanVerCompare(eco, a, b) {
+  if (eco === 'pypi')  return pypiVersionCompare(a, b);
+  if (eco === 'maven') return mavenVersionCompare(a, b);
+  return semverCompare(a, b);
+}
 function scanReleaseParts(eco, v) {
   if (eco === 'pypi') { const p = pypiVersionParts(v); return [p[1] || 0, p[2] || 0, p[3] || 0]; }
+  // Maven versions have no fixed arity and can carry qualifier segments
+  // ('1.7.0-beta01'); non-numeric parts count as 0 for proximity.
+  if (eco === 'maven') { const p = mavenVersionParts(v).map(x => typeof x === 'number' ? x : 0); return [p[0] || 0, p[1] || 0, p[2] || 0]; }
   const p = semverParse(v).parts; return [p[0] || 0, p[1] || 0, p[2] || 0];
 }
 function scanVersionDistance(eco, flagged, pinned) {
@@ -3884,7 +3977,7 @@ function scanClear() {
   document.getElementById('scan-banners').innerHTML = '';
   document.getElementById('scan-results').innerHTML = `<div class="status-placeholder">
     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-    Upload a package-lock.json or requirements.txt to check every dependency against the malware database and for backported CVE fixes
+    Upload a package-lock.json, requirements.txt, or a list of Maven group:artifact:version coordinates to check every dependency against the malware database and for backported CVE fixes
   </div>`;
 }
 
@@ -3920,7 +4013,7 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
     return;
   }
   const { packages, ecosystem } = parsed;
-  const ecoLabel = ecosystem === 'pypi' ? 'PyPI' : 'npm';
+  const ecoLabel = SCAN_ECO_LABELS[ecosystem] || ecosystem;
   const btn = document.getElementById('scan-btn');
   btn.disabled = true;
 
@@ -3953,8 +4046,8 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
     }
 
     // 2) Backported CVE fixes: which pinned versions Chainguard already ships a
-    //    patched build of. One bulk lookup, keyed by PEP 503 name (the form the
-    //    VEX mirror stores). The feed covers PyPI and Maven, not npm.
+    //    patched build of. One bulk lookup; results come back under the names we
+    //    sent. The feed covers PyPI and Maven, not npm.
     progressText.textContent = 'Checking for backported CVE fixes…';
     const vexRes = await fetch('/api/cgr-vex/bulk-check', {
       method: 'POST',
@@ -3963,17 +4056,17 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
     }).then(r => r.ok ? r.json() : null).catch(() => null);
     const vexCovered = !!vexRes?.covered;
     if (vexCovered) {
-      for (const p of packages) {
-        Object.assign(p, scanVexInfo(vexRes.results[pep503(p.name)], p.version));
-      }
+      for (const p of packages) Object.assign(p, scanVexInfo(vexRes.results[p.name], p.version));
     }
 
     // 3) Optionally enrich with publish dates (and PyPI source URLs).
+    let datesSkipped = 0;
     if (document.getElementById('scan-fetch-dates').checked) {
-      const byName = await scanFetchDates(ecosystem, packages, (done, total) => {
+      const { byName, skipped } = await scanFetchDates(ecosystem, packages, (done, total) => {
         progressFill.style.width = `${Math.round(done / total * 100)}%`;
         progressText.textContent = `Fetching publish dates: ${done} of ${total} packages…`;
       });
+      datesSkipped = skipped;
       for (const p of packages) {
         const info = byName.get(p.name);
         p.published = (info && p.version && info.times[p.version]) || null;
@@ -3987,6 +4080,11 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
       notes.push(`<div class="banner warn">Parsed a lockfileVersion 1 file — for the most complete transitive coverage, regenerate with a modern npm (lockfileVersion 3).</div>`);
     } else if (ecosystem === 'pypi' && parsed.unpinned > 0) {
       notes.push(`<div class="banner warn">${parsed.unpinned} of ${packages.length} requirement${parsed.unpinned !== 1 ? 's are' : ' is'} not pinned to an exact <code>==</code> version — those can only be checked for package-level malware history, not an exact-version hit. For a complete scan, use a fully pinned file (e.g. <code style="font-family:monospace;background:#fef3c7;padding:1px 4px;border-radius:3px">uv pip compile</code> output or <code style="font-family:monospace;background:#fef3c7;padding:1px 4px;border-radius:3px">pip freeze</code>).</div>`);
+    } else if (ecosystem === 'maven' && parsed.skipped > 0) {
+      notes.push(`<div class="banner warn">Skipped ${parsed.skipped} line${parsed.skipped !== 1 ? 's' : ''} that did not parse as <code>group:artifact:version</code>.</div>`);
+    }
+    if (datesSkipped > 0) {
+      notes.push(`<div class="banner info">Publish dates cover the first ${SCAN_MAVEN_DATE_CAP} coordinates — ${datesSkipped} more went undated to keep the scan quick. Malware and backported-fix results cover every coordinate.</div>`);
     }
     if (!vexCovered) {
       notes.push(`<div class="banner info">Chainguard's <a href="https://libraries.cgr.dev/openvex/v1/all.json" target="_blank" rel="noopener" style="color:#0369a1;">backported-fix feed</a> covers PyPI and Maven only, so this ${ecoLabel} scan checks malware alone.</div>`);

@@ -1044,11 +1044,13 @@ function vexBaseVersion(v) {
 }
 
 // Package name in the form the feed — and the `vex` table — uses: PEP 503 for
-// pypi, `group:artifact` for maven. null for any other ecosystem (the feed
-// publishes pypi and maven only).
+// pypi, `group/artifact` for maven. null for any other ecosystem (the feed
+// publishes pypi and maven only). Maven doc ids are `maven/<group>/<artifact>`,
+// so the stored name keeps that slash even though coordinates are written
+// `group:artifact`; callers may pass either separator.
 function vexNormPkg(eco, pkg) {
   if (eco === 'pypi')  return pkg.toLowerCase().replace(/[-_.]+/g, '-');
-  if (eco === 'maven') return pkg.replace('/', ':');
+  if (eco === 'maven') return pkg.replace(':', '/');
   return null;
 }
 
@@ -1398,16 +1400,20 @@ Bun.serve({
       const { group, artifact, versions } = await req.json();
       if (!group || !artifact || !Array.isArray(versions)) return new Response('Bad request', { status: 400 });
       const groupPath = group.replace(/\./g, '/');
+      // Central first; Google's Android repo second, since androidx / com.google.android
+      // coordinates (common in a GAR export) never reach Central.
+      const REPOS = ['https://repo1.maven.org/maven2', 'https://dl.google.com/dl/android/maven2'];
       const results = await Promise.all(
         versions.map(async v => {
-          const pomUrl = `https://repo1.maven.org/maven2/${groupPath}/${artifact}/${v}/${artifact}-${v}.pom`;
-          try {
-            const res = await fetch(pomUrl, { method: 'HEAD', headers: { 'User-Agent': 'maven-browser/1.0' } });
-            const lastModified = res.headers.get('last-modified');
-            return [v, lastModified ? new Date(lastModified).getTime() : null];
-          } catch {
-            return [v, null];
+          for (const base of REPOS) {
+            const pomUrl = `${base}/${groupPath}/${artifact}/${v}/${artifact}-${v}.pom`;
+            try {
+              const res = await fetch(pomUrl, { method: 'HEAD', headers: { 'User-Agent': 'maven-browser/1.0' } });
+              const lastModified = res.ok && res.headers.get('last-modified');
+              if (lastModified) return [v, new Date(lastModified).getTime()];
+            } catch { /* try the next repo */ }
           }
+          return [v, null];
         })
       );
       return new Response(JSON.stringify(Object.fromEntries(results)), { headers: { 'Content-Type': 'application/json' } });
@@ -1493,21 +1499,31 @@ Bun.serve({
     }
 
     // Bulk backported-fix lookup for a list of package names (Dependency Scan
-    // tab). Results are keyed by the normalized name — PEP 503 for pypi,
-    // `group:artifact` for maven — so callers normalize the same way to read
-    // them. `covered` is false for ecosystems the feed doesn't publish (npm).
+    // tab). Results come back keyed by the names the caller sent, so nothing
+    // has to reproduce the feed's normalization client-side. `covered` is false
+    // for ecosystems the feed doesn't publish (npm).
     if (url.pathname === '/api/cgr-vex/bulk-check' && req.method === 'POST') {
       const body = await req.json().catch(() => ({}));
       const eco = body.ecosystem === 'pypi' || body.ecosystem === 'maven' ? body.ecosystem : null;
       const json = (o) => new Response(JSON.stringify(o), { headers: { 'Content-Type': 'application/json' } });
       if (!eco) return json({ ecosystem: body.ecosystem || null, covered: false, warm: vexWarm, results: {} });
-      // The whole feed is a ~200-doc rebuild, so warming the mirror beats a
+      // The whole feed is a ~500-doc rebuild, so warming the mirror beats a
       // live per-package fetch across a lockfile of hundreds of names.
       if (!vexWarm) await runVexSync().catch(() => {});
-      const names = Array.isArray(body.packages)
-        ? [...new Set(body.packages.filter(n => typeof n === 'string' && n).map(n => vexNormPkg(eco, n)))]
-        : [];
-      return json({ ecosystem: eco, covered: true, warm: vexWarm, results: dbVexFixesBulk(eco, names) });
+      // Several requested names can normalize to one stored name (PyPI casing,
+      // maven's `:` vs `/`), so keep every spelling that asked for it.
+      const asked = new Map(); // normalized → [name as sent]
+      for (const n of (Array.isArray(body.packages) ? body.packages : [])) {
+        if (typeof n !== 'string' || !n) continue;
+        const key = vexNormPkg(eco, n);
+        if (key) (asked.get(key) || asked.set(key, []).get(key)).push(n);
+      }
+      const byNorm = dbVexFixesBulk(eco, [...asked.keys()]);
+      const results = {};
+      for (const [key, names] of asked) {
+        if (byNorm[key]) for (const n of names) results[n] = byNorm[key];
+      }
+      return json({ ecosystem: eco, covered: true, warm: vexWarm, results });
     }
 
     // Browse all backported fixes, newest first. Free-text `q` matches package
