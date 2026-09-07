@@ -3953,16 +3953,20 @@ function scanRender(data) {
   const had   = packages.filter(p => p.status === 'had').length;
   const clean = packages.length - exact - had;
 
+  // Every card counts rows, and a row is a package at one version — so a Maven
+  // coordinate list, which repeats an artifact across versions, is counted in
+  // versions. The labels say which.
+  const unit = ecosystem === 'maven' ? 'Versions' : 'Packages';
   // Distinct CVEs, not statements — the same CVE is often backported across
   // several of a lockfile's packages.
   const withFixes = packages.filter(p => p.vexHere?.length);
   const fixedCves = new Set(withFixes.flatMap(p => p.vexHere.map(vexVulnId)));
   const fixCard = vexCovered ? `<div class="scan-card fix"
-      title="${fixedCves.size} distinct vulnerabilities are already fixed in Chainguard's builds of the versions you pin — no upgrade needed">
-    <div class="sc-num">${withFixes.length}</div><div class="sc-label">🛡 Backported fixes</div></div>` : '';
+      title="Chainguard's builds of these ${withFixes.length} already fix ${fixedCves.size} distinct vulnerabilities — no upgrade needed">
+    <div class="sc-num">${withFixes.length}</div><div class="sc-label">🛡 ${unit} with backported fixes</div></div>` : '';
 
   const cards = `<div class="scan-summary">
-    <div class="scan-card total"><div class="sc-num">${packages.length}</div><div class="sc-label">Packages scanned</div></div>
+    <div class="scan-card total"><div class="sc-num">${packages.length}</div><div class="sc-label">${unit} scanned</div></div>
     <div class="scan-card danger"><div class="sc-num">${exact}</div><div class="sc-label">Known malware</div></div>
     <div class="scan-card warn"><div class="sc-num">${had}</div><div class="sc-label">Has had malware</div></div>
     <div class="scan-card ok"><div class="sc-num">${clean}</div><div class="sc-label">Clean</div></div>
