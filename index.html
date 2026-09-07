@@ -1079,8 +1079,9 @@
         <button type="submit" class="fetch-btn" id="scan-btn">Scan dependencies</button>
         <button type="button" class="copy-btn" onclick="scanClear()">Clear</button>
         <button type="button" class="copy-btn" id="scan-pdf-btn" disabled
-          title="Opens the print dialog — choose &quot;Save as PDF&quot; as the destination for an A4 report">Export PDF</button>
-        <label class="filter-label" id="scan-print-findings-label" style="display:none;"><input type="checkbox" id="scan-print-findings"> Findings only</label>
+          title="Opens the print dialog — choose &quot;Save as PDF&quot; as the destination for an A4 report of the packages with findings">Export PDF</button>
+        <label class="filter-label" id="scan-print-all-label" style="display:none;"
+          title="By default the PDF lists only packages with known malware, malware history, or a backported fix available"><input type="checkbox" id="scan-print-all"> Include clean rows</label>
         <label class="filter-label" style="margin-left:auto;"><input type="checkbox" id="scan-fetch-dates" checked> Fetch publish dates &amp; sources</label>
       </div>
     </form>
@@ -4072,7 +4073,9 @@ async function scanBuildPrintHead(findingsOnly) {
     `Generated ${formatDateExact(Date.now())}`,
     s ? `Malware database: ${s.total.toLocaleString()} entries, synced ${s.lastSyncAt ? formatDateExact(s.lastSyncAt) : 'never'}` : null,
     s?.vex ? `Backported fixes: ${s.vex.fixes.toLocaleString()} across ${s.vex.packages.toLocaleString()} packages, synced ${s.vex.lastSyncAt ? formatDateExact(s.vex.lastSyncAt) : 'never'}` : null,
-    findingsOnly ? `Findings only — showing ${(packages.length - quiet).toLocaleString()} of ${packages.length.toLocaleString()} rows` : null,
+    findingsOnly
+      ? `Findings only: ${(packages.length - quiet).toLocaleString()} of ${packages.length.toLocaleString()} ${unit} — known malware, malware history, or a backported fix for the version in use. The other ${quiet.toLocaleString()} were clean, with no fix available for the version in use.`
+      : `All ${packages.length.toLocaleString()} scanned ${unit} listed, including the ${quiet.toLocaleString()} with nothing to report.`,
   ].filter(Boolean);
 
   document.getElementById('scan-print-head').innerHTML = `
@@ -4088,7 +4091,9 @@ async function scanBuildPrintHead(findingsOnly) {
 async function scanExportPdf() {
   if (!state.scan.packages) return;
   const btn = document.getElementById('scan-pdf-btn');
-  const findingsOnly = document.getElementById('scan-print-findings').checked;
+  // Findings by default — a clean row costs a line of paper and tells the
+  // reader nothing. "Include clean rows" opts back into the full table.
+  const findingsOnly = !document.getElementById('scan-print-all').checked;
   btn.disabled = true;
   try {
     document.getElementById('scan-results').classList.toggle('print-findings-only', findingsOnly);
@@ -4104,7 +4109,9 @@ function scanClear() {
   document.getElementById('scan-banners').innerHTML = '';
   document.getElementById('scan-print-head').innerHTML = '';
   document.getElementById('scan-pdf-btn').disabled = true;
-  document.getElementById('scan-print-findings-label').style.display = 'none';
+  document.getElementById('scan-print-all-label').style.display = 'none';
+  document.getElementById('scan-print-all').checked = false;
+  document.getElementById('scan-results').classList.remove('print-findings-only');
   state.scan = { packages: null };
   _scanSourceName = null;
   document.getElementById('scan-results').innerHTML = `<div class="status-placeholder">
@@ -4229,7 +4236,7 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
     state.scan = { packages, ecosystem, vexCovered };
     scanRender({ packages, ecosystem, vexCovered });
     document.getElementById('scan-pdf-btn').disabled = false;
-    document.getElementById('scan-print-findings-label').style.display = '';
+    document.getElementById('scan-print-all-label').style.display = '';
   } catch (err) {
     document.getElementById('scan-results').innerHTML =
       `<div class="status-placeholder">Unexpected error: ${escHtml(err.message)}</div>`;
