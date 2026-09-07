@@ -702,7 +702,6 @@
   table.scan-table tr.row-exact { background:#fef2f2; }
   table.scan-table tr.row-had   { background:#fffdf5; }
   table.scan-table td.mono { font-family:'SFMono-Regular',Consolas,monospace; font-size:0.78rem; }
-  .scan-src { font-family:'SFMono-Regular',Consolas,monospace; font-size:0.74rem; color:#64748b; word-break:break-all; }
   .scan-status-pill { font-size:0.68rem; font-weight:700; padding:2px 8px; border-radius:99px; white-space:nowrap; }
   .scan-status-pill.exact { background:#dc2626; color:#fff; }
   .scan-status-pill.had   { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; }
@@ -836,17 +835,14 @@
     table.scan-table tr { break-inside: avoid; }
     /* Auto layout hands the chip columns most of the width and squeezes package
        names to 8 characters, so pin the text columns and let the chips flow. */
-    table.scan-table .col-pkg { width: 17%; }
-    table.scan-table .col-ver { width: 7%; }
-    table.scan-table .col-pub { width: 9%; }
-    table.scan-table .col-src { width: 11%; }
+    table.scan-table .col-pkg { width: 19%; }
+    table.scan-table .col-ver { width: 8%; }
+    table.scan-table .col-pub { width: 10%; }
     /* Long maven coordinates and CVE lists need the full column width. */
     table.scan-table td.mono { font-size: 7pt; word-break: break-word; }
-    table.scan-table .col-src .scan-src { font-size: 5.7pt; word-break: break-all; }
     .scan-mal-cell, .scan-fix-cell { max-width: none; gap: 2px; }
     .scan-vchip, .scan-fixchip { font-size: 6.2pt; padding: 0 3px; }
     .scan-status-pill { font-size: 6pt; padding: 0.5mm 1.5mm; }
-    .scan-src { font-size: 6.2pt; }
 
     /* "Findings only" — drop the rows with nothing to report. Hiding them in
        CSS keeps the on-screen table untouched. */
@@ -1082,7 +1078,7 @@
           title="Opens the print dialog — choose &quot;Save as PDF&quot; as the destination for an A4 report of the packages with findings">Export PDF</button>
         <label class="filter-label" id="scan-print-all-label" style="display:none;"
           title="By default the PDF lists only packages with known malware, malware history, or a backported fix available"><input type="checkbox" id="scan-print-all"> Include clean rows</label>
-        <label class="filter-label" style="margin-left:auto;"><input type="checkbox" id="scan-fetch-dates" checked> Fetch publish dates &amp; sources</label>
+        <label class="filter-label" style="margin-left:auto;"><input type="checkbox" id="scan-fetch-dates" checked> Fetch publish dates</label>
       </div>
     </form>
     <div class="print-only scan-print-head" id="scan-print-head"></div>
@@ -3619,8 +3615,8 @@ document.getElementById('bulk-form').addEventListener('submit', async (e) => {
 
 // ── Lockfile Scan tab ─────────────────────────────────────────────────────────
 
-// Rich package-lock.json parser: per-package {name, version, resolved,
-// integrity, dev, link}. Handles lockfileVersion 2/3 (packages{}) and v1
+// Rich package-lock.json parser: per-package {name, version, dev, link}.
+// Handles lockfileVersion 2/3 (packages{}) and v1
 // (dependencies{}, recursive).
 // PEP 503 normalized name (lowercase, runs of -_. collapsed to a single -).
 // PyPI treats these as equivalent; the malware DB may store either form, so we
@@ -3693,7 +3689,7 @@ function scanParseGav(text) {
     const key = `${name}@${version}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ name, group, artifact, version, resolved: null, integrity: null, dev: false });
+    out.push({ name, group, artifact, version, dev: false });
   }
   if (!out.length) return { error: 'No Maven coordinates found — expected one "group:artifact:version" per line.' };
   return { ecosystem: 'maven', packages: out, skipped };
@@ -3703,7 +3699,7 @@ function scanParseYarnLock(text) {
   const parsed = parseYarnLock(text);
   if (!parsed || !parsed.packages.length) return { error: 'No packages found in yarn.lock.' };
   const out = parsed.packages.map(({ name, requestedVersion }) => ({
-    name, version: requestedVersion, resolved: null, integrity: null, dev: false,
+    name, version: requestedVersion, dev: false,
   }));
   return { ecosystem: 'npm', packages: out };
 }
@@ -3719,8 +3715,6 @@ function scanParseNpmLock(obj) {
     seen.add(key);
     out.push({
       name, version,
-      resolved: entry.resolved || null,
-      integrity: entry.integrity || null,
       dev: !!(entry.dev || entry.devOptional),
     });
   };
@@ -3757,7 +3751,7 @@ function scanParseRequirements(text) {
     const key = pep503(name) + '@' + version;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ name, version, spec: requestedVersion, resolved: null, integrity: null, dev: false });
+    out.push({ name, version, spec: requestedVersion, dev: false });
   }
   return { ecosystem: 'pypi', packages: out, unpinned: out.filter(p => !p.version).length };
 }
@@ -3766,8 +3760,7 @@ function scanParsePoetry(text) {
   const parsed = parsePoetryLock(text);
   if (!parsed) return { error: 'Could not parse poetry.lock.' };
   const out = parsed.packages.map(p => ({
-    name: p.name, version: p.requestedVersion || '', spec: p.requestedVersion || '',
-    resolved: null, integrity: null, dev: false,
+    name: p.name, version: p.requestedVersion || '', spec: p.requestedVersion || '', dev: false,
   }));
   return { ecosystem: 'pypi', packages: out, unpinned: out.filter(p => !p.version).length };
 }
@@ -3795,11 +3788,6 @@ function scanVexInfo(fixes, version) {
       .filter(f => f.baseVersion === version || f.fullVersion === version)
       .map(f => f.fullVersion))],
   };
-}
-
-function scanSourceHost(resolved) {
-  if (!resolved) return null;
-  try { return new URL(resolved).host; } catch { return resolved; }
 }
 
 // Maven publishes no bulk "every release with its date" endpoint, so dates come
@@ -3834,7 +3822,7 @@ async function scanFetchMavenDates(packages, onProgress) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ group, artifact, versions }),
       });
-      if (res.ok) byName.set(name, { times: await res.json(), sources: {} });
+      if (res.ok) byName.set(name, { times: await res.json() });
     } catch { /* leave undated */ }
     done++;
     onProgress(done, entries.length);
@@ -3842,9 +3830,9 @@ async function scanFetchMavenDates(packages, onProgress) {
   return { byName, skipped };
 }
 
-// Fetch publish dates (and, for PyPI, source URLs) per package name, keyed
-// name → { times: {version: iso}, sources: {version: url} }. Cached per name so
-// duplicated packages only cost one request. Registries allow cross-origin GETs.
+// Fetch publish dates per package name, keyed name → { times: {version: iso} }.
+// Cached per name so duplicated packages only cost one request. Registries allow
+// cross-origin GETs.
 async function scanFetchDates(eco, packages, onProgress) {
   if (eco === 'maven') return scanFetchMavenDates(packages, onProgress);
   const names = [...new Set(packages.map(p => p.name))];
@@ -3856,18 +3844,17 @@ async function scanFetchDates(eco, packages, onProgress) {
         const r = await fetch(`https://pypi.org/pypi/${encodeURIComponent(name)}/json`);
         if (r.ok) {
           const d = await r.json();
-          const times = {}, sources = {};
+          const times = {};
           for (const [ver, files] of Object.entries(d.releases || {})) {
             if (!files || !files.length) continue;
             const f = files.find(x => x.packagetype === 'sdist') || files[0];
             times[ver] = f.upload_time_iso_8601 || (f.upload_time ? f.upload_time + 'Z' : null);
-            sources[ver] = f.url || null;
           }
-          byName.set(name, { times, sources });
+          byName.set(name, { times });
         }
       } else {
         const r = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}`);
-        if (r.ok) { const d = await r.json(); byName.set(name, { times: d.time || {}, sources: {} }); }
+        if (r.ok) { const d = await r.json(); byName.set(name, { times: d.time || {} }); }
       }
     } catch { /* leave undated */ }
     done++;
@@ -3980,8 +3967,6 @@ function scanRenderTable(eco, packages, showFixes) {
     (order[a.status] - order[b.status]) || (fixRank(a) - fixRank(b))
     || a.name.localeCompare(b.name) || scanVerCompare(eco, a.version, b.version));
   const body = rows.map(p => {
-    const host = scanSourceHost(p.resolved);
-    const srcTip = [p.resolved, p.integrity].filter(Boolean).join('\n');
     const pill = p.status === 'exact'
       ? '<span class="scan-status-pill exact">MALWARE</span>'
       : p.status === 'had'
@@ -4004,12 +3989,11 @@ function scanRenderTable(eco, packages, showFixes) {
       <td>${scanMalwareCell(eco, p)}</td>
       ${showFixes ? `<td>${scanFixCell(p)}</td>` : ''}
       <td class="col-pub">${p.published ? escHtml(formatDate(p.published)) : '<span style="color:#cbd5e1">—</span>'}</td>
-      <td class="col-src">${host ? `<span class="scan-src" title="${escHtml(srcTip)}">${escHtml(host)}</span>` : '<span style="color:#cbd5e1">—</span>'}</td>
     </tr>`;
   }).join('');
   const fixHead = showFixes ? '<th title="CVEs already fixed in Chainguard\'s build of the version you use">Backported fixes</th>' : '';
   return `<div class="table-wrap"><table class="scan-table">
-    <thead><tr><th>Status</th><th class="col-pkg">Package</th><th class="col-ver">In use</th><th>Malware versions</th>${fixHead}<th class="col-pub">Published</th><th class="col-src">Source</th></tr></thead>
+    <thead><tr><th>Status</th><th class="col-pkg">Package</th><th class="col-ver">In use</th><th>Malware versions</th>${fixHead}<th class="col-pub">Published</th></tr></thead>
     <tbody>${body}</tbody>
   </table></div>`;
 }
@@ -4194,7 +4178,6 @@ document.getElementById('scan-form').addEventListener('submit', async (e) => {
       for (const p of packages) {
         const info = byName.get(p.name);
         p.published = (info && p.version && info.times[p.version]) || null;
-        if (ecosystem === 'pypi' && info && p.version && info.sources[p.version]) p.resolved = info.sources[p.version];
       }
     }
 
