@@ -729,6 +729,7 @@
   .check-cell-left { text-align: left; }
   .check-cell-left .check-and-prov { display: flex; justify-content: flex-start; }
   .date-cell { font-size: 0.82rem; color: #64748b; white-space: nowrap; }
+  .date-utc { display: block; font-size: 0.72rem; color: #94a3b8; }
   .check-cell { text-align: center; }
   .check-link {
     display: inline-flex;
@@ -1252,12 +1253,6 @@ function escHtml(s) {
 }
 
 const dateFmt = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
-function formatDate(ts) {
-  const d = new Date(typeof ts === 'number' ? ts : ts);
-  if (isNaN(d)) return '';
-  const days = Math.floor((Date.now() - d) / 86400000);
-  return `${dateFmt.format(d)} (${days}d ago)`;
-}
 
 // UTC calendar date. Use this wherever a date sits next to a UTC-bucketed chart,
 // so a late-in-the-day UTC timestamp doesn't read as the next day locally.
@@ -1273,6 +1268,17 @@ function formatDateExact(ts) {
   const d = new Date(typeof ts === 'number' ? ts : ts);
   if (isNaN(d)) return '';
   return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+}
+
+// Published-date cell for the version tables: UTC date and age on the first
+// line, UTC time of day on a second smaller line. The time is shown rather than
+// tucked into a tooltip because cooldown windows are measured against midnight
+// UTC, so the time of day decides which day a version lands. Both lines are UTC
+// so they can't disagree about the calendar day for readers away from UTC.
+const timeFmtUTC = ts => { const d = new Date(ts); return isNaN(d) ? '' : d.toISOString().slice(11, 19) + ' UTC'; };
+function publishedCell(ts, cls = 'date-cell') {
+  if (!ts || isNaN(new Date(ts))) return `<td class="${cls}"><span style="color:#cbd5e1">—</span></td>`;
+  return `<td class="${cls}">${escHtml(formatDateUTC(ts))}<span class="date-utc">${escHtml(timeFmtUTC(ts))}</span></td>`;
 }
 
 // ── Sortable table headers ───────────────────────────────────────────────────
@@ -1499,12 +1505,18 @@ function vexBadgeHtml(vulns) {
 let libPolicy = null;
 fetch('/api/libraries/policy').then(r => r.json()).then(p => { libPolicy = p; }).catch(() => {});
 
+// Chainguard measures cooldown age to midnight UTC, not the live clock: a version
+// clears the window at the first 00:00 UTC on or after publish + N days, so the
+// real wait is N to N+1 days depending on the publish time of day.
+const UTC_DAY = 86400000;
+const cooldownUntilMs = (pubMs, days) => Math.ceil((pubMs + days * UTC_DAY) / UTC_DAY) * UTC_DAY;
+
 function cooldownInfo(eco, published) {
   const pol = libPolicy?.enabled ? libPolicy.ecosystems?.[eco] : null;
   if (!pol || !pol.cooldownDays || !published) return null;
   const pubMs = typeof published === 'number' ? published : Date.parse(published);
   if (!pubMs) return null;
-  const until = pubMs + pol.cooldownDays * 86400000;
+  const until = cooldownUntilMs(pubMs, pol.cooldownDays);
   if (Date.now() >= until) return null; // aged out
   return { until, days: pol.cooldownDays, mode: pol.mode, policyName: pol.policyName };
 }
@@ -1519,19 +1531,22 @@ function cooldownBadgeHtml(eco, published, authoritativeUntil) {
   if (!pol || !pol.cooldownDays) return '';
   let until = null, confirmed = false;
   if (authoritativeUntil) {
+    // Snap the platform's own unblock time to the same midnight-UTC boundary the
+    // gate enforces; a no-op when it already reports one.
     const t = typeof authoritativeUntil === 'number' ? authoritativeUntil : Date.parse(authoritativeUntil);
-    if (t && Date.now() < t) { until = t; confirmed = true; }
+    if (t) { const u = Math.ceil(t / UTC_DAY) * UTC_DAY; if (Date.now() < u) { until = u; confirmed = true; } }
   }
   if (!until) { const ci = cooldownInfo(eco, published); if (ci) until = ci.until; }
   if (!until || Date.now() >= until) return '';
   const left = until - Date.now();
-  const d = Math.floor(left / 86400000);
-  const h = Math.floor((left % 86400000) / 3600000);
+  const d = Math.floor(left / UTC_DAY);
+  const h = Math.floor((left % UTC_DAY) / 3600000);
   const leftStr = d > 0 ? `${d}d ${h}h` : `${h}h`;
-  const availDate = new Date(until).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  const availDate = new Date(until).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
   const tip = [
     `Within your org's Chainguard cooldown window (${pol.cooldownDays}-day ${pol.policyName || 'policy'}${pol.mode && pol.mode !== 'ENFORCED' ? `, ${pol.mode}` : ''}).`,
-    `Available ${availDate} (in ${leftStr}).`,
+    `Cooldown age counts to midnight UTC, so the wait runs ${pol.cooldownDays}–${pol.cooldownDays + 1} days from publish.`,
+    `Available ${availDate} 00:00 UTC (in ${leftStr}).`,
     confirmed ? 'Confirmed by a blocked pull from your organization.' : null,
   ].filter(Boolean).join('\n');
   return `<span class="badge-cooldown" data-tip="${escHtml(tip)}">⏳ cooldown · ${leftStr}${confirmed ? ' ✓' : ''}</span>`;
@@ -2103,7 +2118,7 @@ function npmRenderTable(data) {
     const isLatest = row.version === latest;
     html += `<tr${isLatest ? ' class="latest"' : ''}>`;
     html += `<td><div class="version-cell"><code>${escHtml(row.version)}</code>${isLatest ? '<span class="badge-latest">latest</span>' : ''}${row.hasInstallScripts ? '<span class="badge-scripts" title="Has install lifecycle scripts (preinstall/install/postinstall)">scripts</span>' : ''}${showMalware ? malwareBadgeHtml(row.malware) : ''}</div></td>`;
-    html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
+    html += publishedCell(row.published);
     const yankedBadge = row.isYanked ? '<span class="badge-yanked" title="Yanked/pulled from npmjs.com — usually means the maintainer (or npm) removed it after a malware report or supply-chain attack">yanked</span>' : '';
     html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${checkCell(row.npmTarball)}${yankedBadge}<span id="npm-att-${idx}"></span></div></td>`;
     html += `<td class="check-cell check-cell-left"><div class="check-and-prov">${npmCgrCheckCell(row.cgrTarball)}<span id="cgr-att-${idx}"></span>${npmCgrBadge(row.cgrTarball)}${row.cgrTarball ? '' : cooldownBadgeHtml('npm', row.published, row.cooldownUntil)}</div></td>`;
@@ -2130,12 +2145,12 @@ function npmCopyResults() {
     '',
   ];
   const vw = Math.max(7, ...rows.map(r => r.version.length + (r.version === latest ? 9 : 0))) + 2;
-  const dw = Math.max(9, ...rows.map(r => r.published ? formatDate(r.published).length : 0)) + 2;
+  const dw = Math.max(9, ...rows.map(r => r.published ? formatDateUTC(r.published).length : 0)) + 2;
   lines.push('Version'.padEnd(vw) + 'Published'.padEnd(dw) + 'npmjs.com'.padEnd(12) + 'Chainguard');
   lines.push('─'.repeat(vw + dw + 22));
   for (const row of rows) {
     const cgrLabel = !row.cgrTarball ? '✗' : row.cgrTarball.includes('javascript-upstream') ? '✓ Scanned Upstream' : '✓ Built from Source';
-    lines.push((row.version + (row.version === latest ? ' (latest)' : '')).padEnd(vw) + (row.published ? formatDate(row.published) : '—').padEnd(dw) + (row.npmTarball ? '✓' : '✗').padEnd(12) + cgrLabel);
+    lines.push((row.version + (row.version === latest ? ' (latest)' : '')).padEnd(vw) + (row.published ? formatDateUTC(row.published) : '—').padEnd(dw) + (row.npmTarball ? '✓' : '✗').padEnd(12) + cgrLabel);
   }
   copyToClipboard(lines.join('\n'), document.getElementById('npm-copy-btn'));
 }
@@ -2500,7 +2515,7 @@ function mavenRenderTable(data) {
     const cgrUrl = row.cgrType ? `https://libraries.cgr.dev/java/${group.replace(/\./g,'/')}/${artifact}/${row.version}/${artifact}-${row.version}.pom` : null;
     html += `<tr${isLatest ? ' class="latest"' : ''}>`;
     html += `<td><div class="version-cell"><code>${escHtml(row.version)}</code>${isLatest ? '<span class="badge-latest">latest</span>' : ''}${showMalware ? malwareBadgeHtml(row.malware) : ''}${showVex ? vexBadgeHtml(row.vex) : ''}</div></td>`;
-    html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
+    html += publishedCell(row.published);
     html += `<td class="check-cell">${checkCell(mvnUrl)}</td>`;
     html += `<td class="check-cell">${cgrCheckCell(row.cgrType, cgrUrl, 'maven')}${row.cgrType ? '' : cooldownBadgeHtml('maven', row.published, row.cooldownUntil)}</td>`;
     html += `</tr>`;
@@ -2521,11 +2536,11 @@ function mavenCopyResults() {
     '',
   ];
   const vw = Math.max(7, ...rows.map(r => r.version.length + (r.version === latest ? 9 : 0))) + 2;
-  const dw = Math.max(9, ...rows.map(r => r.published ? formatDate(r.published).length : 0)) + 2;
+  const dw = Math.max(9, ...rows.map(r => r.published ? formatDateUTC(r.published).length : 0)) + 2;
   lines.push('Version'.padEnd(vw) + 'Published'.padEnd(dw) + 'Maven Central'.padEnd(16) + 'Chainguard');
   lines.push('─'.repeat(vw + dw + 26));
   for (const row of rows) {
-    lines.push((row.version + (row.version === latest ? ' (latest)' : '')).padEnd(vw) + (row.published ? formatDate(row.published) : '—').padEnd(dw) + (row.inMvn ? '✓' : '✗').padEnd(16) + (!row.cgrType ? '✗' : row.cgrType === 'built' ? '✓ Built from Source' : '✓ Scanned Upstream'));
+    lines.push((row.version + (row.version === latest ? ' (latest)' : '')).padEnd(vw) + (row.published ? formatDateUTC(row.published) : '—').padEnd(dw) + (row.inMvn ? '✓' : '✗').padEnd(16) + (!row.cgrType ? '✗' : row.cgrType === 'built' ? '✓ Built from Source' : '✓ Scanned Upstream'));
   }
   copyToClipboard(lines.join('\n'), document.getElementById('maven-copy-btn'));
 }
@@ -3033,7 +3048,7 @@ function pypiRenderTable(data) {
     const isLatest = row.version === latest;
     html += `<tr${isLatest ? ' class="latest"' : ''}>`;
     html += `<td><div class="version-cell"><code>${escHtml(row.version)}</code>${isLatest ? '<span class="badge-latest">latest</span>' : ''}${showMalware ? malwareBadgeHtml(row.malware) : ''}${showVex ? vexBadgeHtml(row.vex) : ''}</div></td>`;
-    html += `<td class="date-cell"${row.published ? ` title="${escHtml(formatDateExact(row.published))}"` : ''}>${row.published ? escHtml(formatDate(row.published)) : '<span style="color:#cbd5e1">—</span>'}</td>`;
+    html += publishedCell(row.published);
     html += `<td class="check-cell">${checkCell(row.pypiUrl)}</td>`;
     const covered = hasCgrWheel(row);
     html += `<td class="check-cell">${cgrCheckCell(covered ? row.cgrType : null, covered ? row.cgrTarball : null, 'pypi')}${covered ? '' : cooldownBadgeHtml('pypi', row.published, row.cooldownUntil)}</td>`;
@@ -3056,13 +3071,13 @@ function pypiCopyResults() {
     '',
   ];
   const vw = Math.max(7, ...rows.map(r => r.version.length + (r.version === latest ? 9 : 0))) + 2;
-  const dw = Math.max(9, ...rows.map(r => r.published ? formatDate(r.published).length : 0)) + 2;
+  const dw = Math.max(9, ...rows.map(r => r.published ? formatDateUTC(r.published).length : 0)) + 2;
   lines.push('Version'.padEnd(vw) + 'Published'.padEnd(dw) + 'PyPI'.padEnd(10) + 'Chainguard');
   lines.push('─'.repeat(vw + dw + 20));
   for (const row of rows) {
     const covered = (row.cgrPlatforms?.wheelCount || 0) > 0;
     const cgrLabel = !covered ? (row.cgrPlatforms?.hasSdist ? '✗ (sdist only)' : '✗') : row.cgrType === 'built' ? '✓ Built from Source' : '✓ Scanned Upstream';
-    lines.push((row.version + (row.version === latest ? ' (latest)' : '')).padEnd(vw) + (row.published ? formatDate(row.published) : '—').padEnd(dw) + (row.pypiUrl ? '✓' : '✗').padEnd(10) + cgrLabel);
+    lines.push((row.version + (row.version === latest ? ' (latest)' : '')).padEnd(vw) + (row.published ? formatDateUTC(row.published) : '—').padEnd(dw) + (row.pypiUrl ? '✓' : '✗').padEnd(10) + cgrLabel);
   }
   copyToClipboard(lines.join('\n'), document.getElementById('pypi-copy-btn'));
 }
@@ -3988,7 +4003,7 @@ function scanRenderTable(eco, packages, showFixes) {
       <td class="mono col-ver">${inUse}</td>
       <td>${scanMalwareCell(eco, p)}</td>
       ${showFixes ? `<td>${scanFixCell(p)}</td>` : ''}
-      <td class="col-pub">${p.published ? escHtml(formatDate(p.published)) : '<span style="color:#cbd5e1">—</span>'}</td>
+      <td class="col-pub">${p.published ? escHtml(formatDateUTC(p.published)) : '<span style="color:#cbd5e1">—</span>'}</td>
     </tr>`;
   }).join('');
   const fixHead = showFixes ? '<th title="CVEs already fixed in Chainguard\'s build of the version you use">Backported fixes</th>' : '';

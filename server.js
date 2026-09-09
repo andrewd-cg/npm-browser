@@ -565,10 +565,12 @@ async function consoleApiGet(path, params, ctx = '') {
 
 // ── Libraries cooldown policy ───────────────────────────────────────────────
 // Chainguard withholds package versions younger than a per-ecosystem "cooldown"
-// window (age_days < cooldown_days). The window comes from the org's policy
-// bindings; we resolve it once and cache it so the UI can badge in-cooldown
-// versions. Set LIBRARIES_ORG to the org name or group UIDP to enable this;
-// when unset the cooldown feature is simply off (no badges).
+// window, measuring age to midnight UTC rather than the live clock: a version is
+// withheld until it was published on or before 00:00 UTC today minus
+// cooldown_days, so the real wait runs cooldown_days to cooldown_days + 1. The
+// window comes from the org's policy bindings; we resolve it once and cache it
+// so the UI can badge in-cooldown versions. Set LIBRARIES_ORG to the org name
+// or group UIDP to enable this; when unset the feature is off (no badges).
 const LIBRARIES_ORG = process.env.LIBRARIES_ORG || null;
 const POLICY_ECO_MAP = { JAVASCRIPT: 'npm', PYTHON: 'pypi', JAVA: 'maven' };
 const POLICY_TTL = 5 * 60 * 1000;
